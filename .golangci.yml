@@ -11,7 +11,7 @@ linters:
     - exhaustive      # every enum case handled (states, account kinds)
     - forcetypeassert
     - gocritic
-    - gosec
+    - gosec           # the only gosec run: the standalone binary cannot type-check Go 1.27 yet
     - misspell
     - nilerr
     - noctx           # HTTP/DB calls must take a context
