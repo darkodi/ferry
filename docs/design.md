@@ -27,20 +27,17 @@
 Five Go binaries share one Postgres database; nothing talks to the outside world inside a transaction.
 
 ```mermaid
-flowchart LR
+flowchart TB
     Client -->|REST| API
-    Rail["Fiat rail<br/>Noah sandbox / mock"] -->|webhooks| API
-    API -->|"one tx: state, postings, outbox"| PG[("Postgres<br/>ledger, payouts,<br/>outbox, inbox")]
-    Testnets["Testnets<br/>EVM, Solana"] -->|logs, blocks| Watchers["Chain watchers"]
-    Watchers -->|deposits| PG
-    PG -->|outbox rows| Relay
-    Relay -->|events| SQS["SQS + DLQ"]
-    SQS -->|consume| Worker
+    Chain["Testnets<br/>EVM, Solana"] -->|logs| Watch["Watchers"]
+    API -->|one tx| PG[("Postgres")]
+    Watch -->|deposits| PG
+    PG -->|outbox| Relay["Relay → SQS + DLQ"]
+    Relay -->|events| Worker
     Worker -->|writes| PG
-    Worker -->|"submit (same Nonce on retry)"| Rail
-    Recon["Recon job (daily)"] -.->|reads| PG
-    Recon -.->|compares| Rail
-    Recon -.->|compares| Testnets
+    Worker -->|"submit, same Nonce"| Rail["Fiat rail<br/>Noah sandbox / mock"]
+    Rail -->|webhooks| API
+    Recon["Recon, daily<br/>checks Postgres against<br/>chain and rail"] -.-> PG
 ```
 
 The API and watchers write state, postings and outbox rows in one transaction. The relay turns committed rows into SQS events; the worker consumes them, calls the rail, and writes the result back. Recon reads Postgres and compares it with chain and rail data.
