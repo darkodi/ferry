@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to full commit SHAs (tag in the comment) so a
+# moved tag cannot change what runs in CI.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test -race -count=1 ./... # testcontainers uses the runner's Docker
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+        with:
+          version: v2.15.0
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # gitleaks scans full history
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gosec
+        run: make gosec
+      - name: govulncheck
+        run: make vuln
+      - name: gitleaks
+        run: make gitleaks

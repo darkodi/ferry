@@ -1,0 +1,44 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - errorlint       # wrapped errors compared with errors.Is/As
+    - exhaustive      # every enum case handled (states, account kinds)
+    - forcetypeassert
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx           # HTTP/DB calls must take a context
+    - nolintlint      # every //nolint needs a specific linter and a reason
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wrapcheck
+  settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    exhaustive:
+      default-signifies-exhaustive: false
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters: [wrapcheck, forcetypeassert, gosec]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/darkodi/ferry
