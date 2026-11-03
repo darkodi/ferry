@@ -26,20 +26,21 @@
 
 Five Go binaries share one Postgres database; nothing talks to the outside world inside a transaction.
 
-```text
-                 REST                           webhooks
- Client ---------------------> API service <------------------ Fiat rail (Noah sandbox / mock)
-                                   |                                 ^
-                                   | one tx                          | submit (same Nonce on retry)
-                                   v                                 |
- Chain watchers --deposits--> [ POSTGRES ] <------writes------- Payout worker
- (EVM, Solana)               ledger, payouts,                        ^
-       ^                     outbox, inbox                           | consume
-       | logs, blocks              |                                 |
- Testnets                          v outbox rows                     |
-                             Outbox relay ------events------> SQS + DLQ
-
- Recon job: reads Postgres, compares with chain and rail data daily
+```mermaid
+flowchart LR
+    Client -->|REST| API
+    Rail["Fiat rail<br/>Noah sandbox / mock"] -->|webhooks| API
+    API -->|"one tx: state, postings, outbox"| PG[("Postgres<br/>ledger, payouts,<br/>outbox, inbox")]
+    Testnets["Testnets<br/>EVM, Solana"] -->|logs, blocks| Watchers["Chain watchers"]
+    Watchers -->|deposits| PG
+    PG -->|outbox rows| Relay
+    Relay -->|events| SQS["SQS + DLQ"]
+    SQS -->|consume| Worker
+    Worker -->|writes| PG
+    Worker -->|"submit (same Nonce on retry)"| Rail
+    Recon["Recon job (daily)"] -.->|reads| PG
+    Recon -.->|compares| Rail
+    Recon -.->|compares| Testnets
 ```
 
 The API and watchers write state, postings and outbox rows in one transaction. The relay turns committed rows into SQS events; the worker consumes them, calls the rail, and writes the result back. Recon reads Postgres and compares it with chain and rail data.
@@ -67,6 +68,57 @@ The ledger is the source of truth; every other table is a workflow record that p
 | `balances` | Cached sum per account, updated in the same tx | account\_id, currency, posted, allow\_negative, updated\_at; `CHECK (allow_negative OR posted >= 0)` |
 | `balances_history` | One row per balance change, written by trigger | account\_id, old\_posted, new\_posted, entry\_id, changed\_at |
 
+```mermaid
+erDiagram
+    currencies ||--o{ accounts : "denominates"
+    accounts ||--|| balances : "cached sum"
+    accounts ||--o{ postings : "debited or credited by"
+    journal_entries ||--|{ postings : "has lines"
+    journal_entries |o--o| journal_entries : "reverses_entry_id"
+    balances ||--o{ balances_history : "every change"
+    currencies {
+        text code PK
+        int decimals
+    }
+    accounts {
+        bigint id PK
+        text owner_type "customer or house"
+        uuid owner_id "NULL for house"
+        text currency FK
+        text kind
+        text normal_side "debit or credit"
+        bool allow_negative
+    }
+    journal_entries {
+        bigint id PK
+        text idempotency_key UK
+        text type
+        text ref_type
+        uuid ref_id
+        bigint reverses_entry_id UK
+    }
+    postings {
+        bigint id PK
+        bigint entry_id FK
+        bigint account_id FK
+        text currency "FK with account_id"
+        text direction "debit or credit"
+        numeric amount "greater than 0"
+    }
+    balances {
+        bigint account_id PK
+        numeric posted "on normal side"
+        bool allow_negative
+    }
+    balances_history {
+        bigint id PK
+        bigint account_id FK
+        numeric old_posted
+        numeric new_posted
+        bigint entry_id
+    }
+```
+
 Account kinds:
 
 | Kind | Owner | Nature | Normal side | May go negative | Meaning |
@@ -80,6 +132,33 @@ Account kinds:
 | `return_fees` | house | expense | debit | yes | Reserved for shortfalls Ferry might absorb on bank returns; unused in v1 |
 
 A payout is not Ferry's cost: it is the customer's money leaving the system, so settlement reduces a liability (`in_transit`) and an asset (`noah_prefunded`) together.
+
+Each arrow below points from the **debited** account to the **credited** account, the notation used throughout this document. For the house assets it can look backwards: in a `treasury_topup` the arrow points `noah_prefunded → chain_omnibus` because Noah's balance is debited (it grows) and the omnibus is credited (it shrinks), while the coins physically move the other way.
+
+```mermaid
+flowchart LR
+    subgraph house["House accounts: Ferry's own books (may go negative)"]
+        OMN["chain_omnibus<br/>asset"]
+        NOAH["noah_prefunded<br/>asset"]
+        FEES["fees<br/>revenue, unused in v1"]
+        RF["return_fees<br/>expense, unused in v1"]
+    end
+    subgraph cust["Customer accounts: what Ferry owes (never negative)"]
+        AV["available"]
+        HELD["held"]
+        TR["in_transit"]
+    end
+    OMN -->|deposit| AV
+    NOAH -->|treasury_topup| OMN
+    AV -->|hold| HELD
+    HELD -->|submit| TR
+    HELD -->|release_hold| AV
+    TR -->|"settle: actual + rail fee"| NOAH
+    TR -->|"settle: remainder"| AV
+    TR -->|fail_in_transit| AV
+    NOAH -->|bank_return| AV
+```
+
 
 Rules:
 
@@ -104,6 +183,51 @@ A payout first holds the rail's authorized amount: `CryptoAuthorizedAmount` from
 
 A failure releases `held → available` or `in_transit → available`. A later bank return arrives as USDC back in Ferry's Noah balance: debit `noah_prefunded`, credit customer `available`, both for the returned amount. The shortfall (return fees, FX) has already left with the settlement; the customer bears it, and Ferry does not absorb it in v1. Funding the Noah balance from chain is a treasury move: debit `noah_prefunded`, credit `chain_omnibus`. The customer's spendable balance is `available` only.
 
+### Entry types
+
+A journal entry is one business event; its `type` says which. Each type has one builder function in `internal/ledger/rules.go`, so the rest of the code never assembles postings by hand.
+
+| `type` | Debit | Credit | Posted when | Idempotency key |
+| --- | --- | --- | --- | --- |
+| `deposit` | `chain_omnibus` | customer `available` | Deposit reaches its confirmation threshold | `deposit:{chain}:{tx}:{log}` |
+| `treasury_topup` | `noah_prefunded` | `chain_omnibus` | USDC is moved from the omnibus wallet to Noah | `topup:{ref}` |
+| `hold` | `available` | `held` | Customer confirms a payout (quote still valid) | `payout:{id}:hold` |
+| `submit` | `held` | `in_transit` | Rail accepts the payout | `payout:{id}:submit` |
+| `release_hold` | `held` | `available` | Rail rejects at submit | `payout:{id}:release` |
+| `settle` | `in_transit` (authorized) | `noah_prefunded` (actual + rail fee), `available` (remainder) | Rail reports `Settled` | `payout:{id}:settle` |
+| `fail_in_transit` | `in_transit` | `available` | Compliance rejects after review | `payout:{id}:fail` |
+| `bank_return` | `noah_prefunded` | `available` | Bank returns a settled payout (returned amount only) | `payout:{id}:return:{rail_tx}` |
+| `reversal` | the original's credits | the original's debits | Correction of a posted entry; sets `reverses_entry_id` | `reverse:{entry_id}` |
+| `adjustment` | any | any | Human-approved fix for a recon break; carries a reason | `adjust:{break_id}` |
+
+### Worked example
+
+Acme deposits 100 USDC, Ferry tops up its Noah balance with 60, and Acme makes one payout. The rail authorizes 50.20 and settles with actual 49.50, rail fee 0.30 and remainder 0.40 (50.20 = 49.50 + 0.30 + 0.40). Amounts are shown in USDC; in the database they are minor units (100 USDC = `100000000`).
+
+| # | Entry `type` | Debit | Credit | Amount |
+| --- | --- | --- | --- | --- |
+| 1 | `deposit` | `chain_omnibus` | `available` | 100.00 |
+| 2 | `treasury_topup` | `noah_prefunded` | `chain_omnibus` | 60.00 |
+| 3 | `hold` | `available` | `held` | 50.20 |
+| 4 | `submit` | `held` | `in_transit` | 50.20 |
+| 5 | `settle` | `in_transit` | `noah_prefunded` | 49.80 |
+| 5 | | | `available` | 0.40 |
+
+Entry 5 has one debit (50.20) and two credits (49.80 + 0.40), so it balances. Balances after each entry, each counted on the account's normal side:
+
+| After entry | `chain_omnibus` | `noah_prefunded` | `available` | `held` | `in_transit` |
+| --- | --- | --- | --- | --- | --- |
+| start | 0 | 0 | 0 | 0 | 0 |
+| 1 deposit | 100.00 | 0 | 100.00 | 0 | 0 |
+| 2 topup | 40.00 | 60.00 | 100.00 | 0 | 0 |
+| 3 hold | 40.00 | 60.00 | 49.80 | 50.20 | 0 |
+| 4 submit | 40.00 | 60.00 | 49.80 | 0 | 50.20 |
+| 5 settle | 40.00 | 10.20 | 50.20 | 0 | 0 |
+
+The last row shows why the ledger holds together: Ferry's assets (40.00 + 10.20 = 50.20) equal what it owes the customer (50.20). The 49.80 that left Ferry's books is exactly what the customer lost: 49.50 paid out plus 0.30 rail fee.
+
+If entry 2 were skipped, `noah_prefunded` would go to −49.80 at settlement. House accounts may go negative, so the entry still posts, and the invariant job raises an alert.
+
 ### Workflow records
 
 | Table | Purpose |
@@ -119,6 +243,26 @@ A failure releases `held → available` or `in_transit → available`. A later b
 ### Payout state machine
 
 `created → quoted → held → submitted → settled`, plus `reversed` (a settled payout returned by the bank days later), `failed` (rail rejected, or compliance rejected after review) and `expired` (quote lapsed before hold). While `submitted`, the payout carries the rail's sub-status (screening, under review, confirming) and any request for information; a compliance review can keep it there for up to 10 days. So `settled` is not terminal: only `reversed`, `failed` and `expired` are. Transitions are a Go table `map[State][]State`; every transition is a single SQL `UPDATE … WHERE id = $1 AND status = $2 AND version = $3` in the same tx as its ledger entry and outbox event. Zero rows updated means another worker won; the caller stops.
+
+Each transition and the ledger entry posted with it:
+
+```mermaid
+stateDiagram-v2
+    [*] --> created
+    created --> quoted: rail prepare, no postings
+    quoted --> held: hold
+    quoted --> expired: quote lapsed, no postings
+    held --> submitted: submit
+    held --> failed: rail rejects, release_hold
+    submitted --> settled: settle
+    submitted --> failed: compliance rejects, fail_in_transit
+    settled --> reversed: bank_return
+    expired --> [*]
+    failed --> [*]
+    reversed --> [*]
+```
+
+`settled` has an outgoing transition, so it is not terminal.
 
 ## Key flows
 
