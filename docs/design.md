@@ -56,50 +56,59 @@ The ledger is the source of truth; every other table is a workflow record that p
 
 ### Ledger
 
-Three tables. Each account row carries its own balance, so there is no separate balances table to keep in sync.
+The ledger is three tables: `accounts` holds the current balances, `journal_entries` records what happened, and `postings` records exactly how much moved where. Everything below follows one story: customer Acme deposits 100 USDC, then starts a payout that reserves 50.20 USDC.
 
-| Table | Purpose | Columns |
-| --- | --- | --- |
-| `accounts` | One per (owner, kind, currency), with its current balance | id, owner\_id (NULL for house accounts), kind, currency, posted, created\_at, updated\_at |
-| `journal_entries` | One business event | id, idempotency\_key (unique), type, ref\_id, reverses\_entry\_id (unique, nullable), created\_at |
-| `postings` | Lines of an entry | id, entry\_id, account\_id, currency, direction (`debit`/`credit`), amount |
+Amounts are stored as whole numbers of millionths of a USDC, so 100 USDC is `100000000`.
 
-Constraints:
+#### 1. `accounts`: who holds what, right now
 
-- `accounts`: `owner_id IS NOT NULL` exactly when `kind` is a customer kind; `CHECK (owner_id IS NULL OR posted >= 0)`, so a customer account can never go negative; unique (owner\_id, kind, currency) for customers and (kind, currency) for house accounts; unique (id, currency) for the postings FK.
-- `postings`: `amount > 0` and within the `int64` range; FK (account\_id, currency) → accounts, so a posting cannot use the wrong currency for its account.
-- `currency`: `CHECK (currency = 'USDC')` in v1. The Noah adapter maps it to the sandbox code `USDC_TEST`.
+One row per account. Each customer has two (`available` and `held`); Ferry's own "house" accounts have no owner. Every row carries its current balance in `posted`, so there is no separate balances table to keep in sync.
 
-```mermaid
-erDiagram
-    accounts ||--o{ postings : "debited or credited by"
-    journal_entries ||--|{ postings : "has lines"
-    journal_entries |o--o| journal_entries : "reverses_entry_id"
-    accounts {
-        bigint id PK
-        uuid owner_id "NULL for house"
-        text kind
-        text currency "USDC"
-        numeric posted "balance, normal side"
-    }
-    journal_entries {
-        bigint id PK
-        text idempotency_key UK
-        text type
-        uuid ref_id
-        bigint reverses_entry_id UK
-    }
-    postings {
-        bigint id PK
-        bigint entry_id FK
-        bigint account_id FK
-        text currency
-        text direction "debit or credit"
-        numeric amount "greater than 0"
-    }
-```
+| id | owner | kind | currency | posted |
+| --- | --- | --- | --- | --- |
+| 1 | none (house) | `chain_omnibus` | USDC | 100000000 |
+| 2 | none (house) | `noah_prefunded` | USDC | 0 |
+| 3 | none (house) | `fees` | USDC | 0 |
+| 4 | Acme | `available` | USDC | 49800000 |
+| 5 | Acme | `held` | USDC | 50200000 |
 
-Account kinds:
+The `posted` values show the balances after the two entries described below. A customer account can never go negative: Go checks this after locking the rows, and the database refuses it too. House accounts may go negative, because they mirror real balances that Ferry does not control; the invariant job raises an alert instead. The database also refuses a customer account without an owner, a house account with an owner, and a second `available` account for the same owner.
+
+#### 2. `journal_entries`: what happened
+
+One row per business event. It says what happened and why, but carries no amounts.
+
+| id | idempotency key | type | ref id | reverses |
+| --- | --- | --- | --- | --- |
+| 1 | `deposit:evm-sepolia:0xab12:3` | `deposit` | the deposit | none |
+| 2 | `payout:9f1c:hold` | `hold` | the payout | none |
+
+- The **idempotency key** is unique and built from the event itself (see Entry types), so processing the same event twice fails on the second insert and money cannot be posted twice. It is unrelated to the client's `Idempotency-Key` header.
+- The **type** is one of the seven in Entry types.
+- **Reverses** is used only by a `correction` that exactly mirrors an earlier entry. Each entry can be mirrored once.
+
+#### 3. `postings`: the money lines
+
+Each entry has at least two lines. A line says which account is debited or credited, and by how much.
+
+| id | entry | account | direction | amount |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | 1 (`chain_omnibus`) | debit | 100000000 |
+| 2 | 1 | 4 (`available`) | credit | 100000000 |
+| 3 | 2 | 4 (`available`) | debit | 50200000 |
+| 4 | 2 | 5 (`held`) | credit | 50200000 |
+
+An amount is always positive; the direction gives the sign. Within one entry, the debits must equal the credits for each currency. Go checks this before inserting, and the database checks it again when the transaction commits. A posting's currency must match its account's.
+
+#### How they work together
+
+To record an event, one database transaction adds the journal entry, adds its postings, and updates `posted` on every account it touches. If any step fails, nothing is saved. A `posted` value always equals the sum of that account's postings, and the invariant job verifies it. Customer accounts count up when credited; the house assets count up when debited, and Go keeps one small lookup from kind to that side.
+
+#### What can never change
+
+Postings and journal entries cannot be edited or deleted, not by the app and not even by the database owner. A mistake is fixed by adding a `correction` entry. The app role (`ferry_app`) can add entries and postings, open accounts, and change only `posted` and `updated_at` on an account.
+
+### Account kinds
 
 | Kind | Owner | Nature | Normal side | May go negative | Meaning |
 | --- | --- | --- | --- | --- | --- |
@@ -108,8 +117,6 @@ Account kinds:
 | `chain_omnibus` | house | asset | debit | yes | Ferry's USDC on-chain (deposit addresses + omnibus wallet) |
 | `noah_prefunded` | house | asset | debit | yes | Ferry's USDC sitting at Noah, the balance payouts are sold from |
 | `fees` | house | revenue | credit | yes | Ferry's own fee income (none in v1: no markup is charged) |
-
-Normal side and nature follow from `kind`, so they are not stored: Go keeps one lookup table from kind to normal side.
 
 A payout is not Ferry's cost: it is the customer's money leaving the system, so settlement reduces a liability (`held`) and an asset (`noah_prefunded`) together.
 
@@ -135,28 +142,11 @@ flowchart LR
     NOAH -->|bank_return| AV
 ```
 
-Rules:
-
-1. Amounts are integers in minor units (USDC has 6 decimals). No floats anywhere. In Go an amount is an `int64` with overflow-checked arithmetic; the DB stores `numeric(38,0)` constrained to the `int64` range.
-2. The ledger is USDC-only in v1. Fiat amounts on quotes are metadata, never posted.
-3. Every posting amount is positive; direction carries the sign. Per entry and per currency, Σdebits = Σcredits, enforced in Go before insert and by a deferred Postgres constraint trigger. `accounts.posted` is expressed on the account's normal side (credit-normal: credits − debits; debit-normal: debits − credits).
-4. Postings and journal entries are append-only. A mistake is fixed with a new `correction` entry; when it exactly mirrors one entry it sets `reverses_entry_id`, and an entry can be mirrored at most once.
-5. No customer account may go negative: checked in Go after locking, backstopped by the `accounts` CHECK. House accounts may go negative; the invariant job alerts on it.
-6. An entry locks every account row it touches with `SELECT … FOR UPDATE`, in ascending `id` order, before computing new balances.
-7. `journal_entries.idempotency_key` is a deterministic business key (see Entry types), so a replayed step cannot post twice. It is unrelated to the client's `Idempotency-Key`.
-8. The app DB role has `SELECT, INSERT` on `journal_entries` and `postings` (never `UPDATE` or `DELETE`), and on `accounts` it may `INSERT` and `UPDATE (posted, updated_at)` only.
-
 ### Holds
 
-A payout first holds the rail's authorized amount: `CryptoAuthorizedAmount` from the rail's prepare step, the most the rail may take after fees and price movement. The money stays in `held` while the payout is `submitted`; whether the rail has accepted it is recorded on the payout and in `rail_transactions`, not in the ledger. With `authorized = actual + rail_fee + remainder`, settlement posts:
+A payout first reserves the rail's authorized amount: `CryptoAuthorizedAmount` from the rail's prepare step, the most the rail may take after fees and price movement. The money moves from `available` to `held` and stays there while the payout is `submitted`; whether the rail has accepted it is recorded on the payout and in `rail_transactions`, not in the ledger.
 
-| Account | Debit | Credit |
-| --- | --- | --- |
-| `held` (customer) | authorized | |
-| `noah_prefunded` | | actual + rail\_fee (what Noah took from Ferry's balance) |
-| `available` (customer) | | remainder |
-
-Any failure, before or after the rail accepted the payout, releases `held → available`. A later bank return arrives as USDC back in Ferry's Noah balance: debit `noah_prefunded`, credit customer `available`, both for the returned amount. The shortfall (return fees, FX) has already left with the settlement; the customer bears it. Funding the Noah balance from chain is a treasury move: debit `noah_prefunded`, credit `chain_omnibus`. The customer's spendable balance is `available` only.
+At settlement the authorized amount splits three ways: `authorized = actual + rail_fee + remainder`. The actual amount and the rail fee leave through `noah_prefunded` (what Noah took from Ferry's balance); the remainder returns to `available`. Any failure, before or after the rail accepted the payout, releases the whole amount back to `available`. If the bank later returns a settled payout, the returned amount is credited to `available`. Any shortfall (return fees, FX) already left with the settlement, and the customer bears it; if Ferry ever absorbs shortfalls, add a `return_fees` expense account in a migration.
 
 ### Entry types
 
@@ -176,31 +166,32 @@ A payout has one `release` key, so the ledger itself guarantees it is released a
 
 ### Worked example
 
-Acme deposits 100 USDC, Ferry tops up its Noah balance with 60, and Acme makes one payout. The rail authorizes 50.20 and settles with actual 49.50, rail fee 0.30 and remainder 0.40 (50.20 = 49.50 + 0.30 + 0.40). Amounts are shown in USDC; in the database they are minor units (100 USDC = `100000000`).
+Continuing with Acme from the tables above (entry 1: 100 USDC deposited; entry 2: 50.20 held). Ferry tops up its Noah balance with 60, then the rail settles the payout with actual 49.50, rail fee 0.30 and remainder 0.40 (50.20 = 49.50 + 0.30 + 0.40). Amounts are shown in USDC.
 
-| # | Entry `type` | Debit | Credit | Amount |
+| Entry | Account | Debit | Credit |
+| --- | --- | --- | --- |
+| 3 `treasury_topup` | `noah_prefunded` | 60.00 | |
+| 3 | `chain_omnibus` | | 60.00 |
+| 4 `settle` | `held` | 50.20 | |
+| 4 | `noah_prefunded` | | 49.80 |
+| 4 | `available` | | 0.40 |
+
+Each entry balances: 60.00 = 60.00, and 50.20 = 49.80 + 0.40. Balances after each step, each counted on the account's normal side:
+
+| After | `chain_omnibus` | `noah_prefunded` | `available` | `held` |
 | --- | --- | --- | --- | --- |
-| 1 | `deposit` | `chain_omnibus` | `available` | 100.00 |
-| 2 | `treasury_topup` | `noah_prefunded` | `chain_omnibus` | 60.00 |
-| 3 | `hold` | `available` | `held` | 50.20 |
-| – | submit (state change only) | | | |
-| 4 | `settle` | `held` | `noah_prefunded` | 49.80 |
-| 4 | | | `available` | 0.40 |
-
-Entry 4 has one debit (50.20) and two credits (49.80 + 0.40), so it balances. Balances after each entry, each counted on the account's normal side:
-
-| After entry | `chain_omnibus` | `noah_prefunded` | `available` | `held` |
-| --- | --- | --- | --- | --- |
-| start | 0 | 0 | 0 | 0 |
-| 1 deposit | 100.00 | 0 | 100.00 | 0 |
-| 2 topup | 40.00 | 60.00 | 100.00 | 0 |
-| 3 hold | 40.00 | 60.00 | 49.80 | 50.20 |
-| submit | 40.00 | 60.00 | 49.80 | 50.20 |
+| entries 1 and 2 (the accounts table above) | 100.00 | 0 | 49.80 | 50.20 |
+| 3 topup | 40.00 | 60.00 | 49.80 | 50.20 |
 | 4 settle | 40.00 | 10.20 | 50.20 | 0 |
 
 The last row shows why the ledger holds together: Ferry's assets (40.00 + 10.20 = 50.20) equal what it owes the customer (50.20). The 49.80 that left Ferry's books is exactly what the customer lost: 49.50 paid out plus 0.30 rail fee.
 
-If entry 2 were skipped, `noah_prefunded` would go to −49.80 at settlement. House accounts may go negative, so the entry still posts, and the invariant job raises an alert.
+If entry 3 were skipped, `noah_prefunded` would go to −49.80 at settlement. House accounts may go negative, so the entry still posts, and the invariant job raises an alert.
+
+### Money rules
+
+1. Amounts are integers in minor units (USDC has 6 decimals). No floats anywhere. In Go an amount is an `int64` with overflow-checked arithmetic; the database stores `numeric(38,0)` constrained to the `int64` range.
+2. The ledger is USDC-only in v1, enforced by a `CHECK`. Fiat amounts on quotes are metadata, never posted. The Noah adapter maps `USDC` to the sandbox code `USDC_TEST`.
 
 ### Workflow records
 
@@ -236,8 +227,6 @@ stateDiagram-v2
     reversed --> [*]
 ```
 
-`settled` has an outgoing transition, so it is not terminal.
-
 ## Key flows
 
 Each step below is one database transaction that changes state, writes ledger postings and writes an outbox event together. External calls happen only between transactions, never inside one.
@@ -246,24 +235,24 @@ Each step below is one database transaction that changes state, writes ledger po
 
 1. Chain watcher sees a USDC `Transfer` (EVM) or token transfer (Solana) to a customer's deposit address.
 2. Insert `deposits` row keyed by `(chain, tx_hash, log_index)` with status `pending`. Duplicate detection is the unique key.
-3. When confirmations reach the chain's threshold, mark `confirmed` and post: debit `chain_omnibus`, credit customer `available`. Emit `deposit.confirmed`.
+3. When confirmations reach the chain's threshold, mark `confirmed` and post a `deposit` entry. Emit `deposit.confirmed`.
 4. If the block is reorged out before confirmation, mark `orphaned`; nothing was posted, so nothing to reverse.
 
 ### Payout (USDC out to fiat)
 
 1. **Create.** `POST /payouts` with `Idempotency-Key`. Validate, run the compliance stub, insert `payouts` (`created`).
 2. **Quote.** Call the rail's prepare endpoint; store `quotes` with the fiat amount, the authorized crypto amount and `expires_at`; move to `quoted`.
-3. **Hold.** Client confirms. In one tx: check the quote is not expired, post the authorized amount `available → held`, move to `held`, emit `payout.held`. Insufficient funds fails here with no side effects.
+3. **Hold.** Client confirms. In one tx: check the quote is not expired, post a `hold` entry for the authorized amount, move to `held`, emit `payout.held`. Insufficient funds fails here with no side effects.
 4. **Submit.** Worker consumes `payout.held`, creates a `rail_transactions` row with a fresh Nonce (stored *before* the call) and `ExternalID = payout_id`, then calls the rail. On acceptance store the rail transaction id and move to `submitted`; no postings, the funds stay in `held`.
 5. **Wait.** While the rail reports `Pending`, webhooks update sub-status (screening, review, request for information). Each webhook is applied only if its `EventVersion` is newer than the stored one.
-6. **Settle.** Rail reports `Settled`. Post the `settle` entry (debit `held` by the authorized amount; credit `noah_prefunded` by actual + rail fee; credit `available` by the remainder); move to `settled`; emit `payout.settled`; send customer webhook.
+6. **Settle.** Rail reports `Settled`. Post the `settle` entry; move to `settled`; emit `payout.settled`; send customer webhook.
 
 ### Failure and reversal
 
-- **Rail rejects at submit** → post `release` (`held → available`), move to `failed`.
-- **Compliance rejects after review** (rail status `Failed`, refund to Ferry's pre-funded rail balance) → post `release` (`held → available`), move to `failed`.
+- **Rail rejects at submit** → post `release`, move to `failed`.
+- **Compliance rejects after review** (rail status `Failed`, refund to Ferry's pre-funded rail balance) → post `release`, move to `failed`.
 - **Quote expires before hold** → move to `expired`; no postings.
-- **Bank returns a settled payout** → the rail sends a *new* transaction whose `Reverses` field points to the original. Post `bank_return` for the returned amount (`noah_prefunded → available`); the customer bears any shortfall; move `settled → reversed`.
+- **Bank returns a settled payout** → the rail sends a *new* transaction whose `Reverses` field points to the original. Post `bank_return` for the returned amount; move `settled → reversed`.
 - **Submit outcome unknown** (timeout, 5xx) → stay `held`, mark `needs_resolution`. The resolver resends with the **same** Nonce (the rail never creates a second transaction for it), then confirms the result by fetching the transaction and matching `ExternalID`. A new Nonce is generated only after a confirmed `Failed`.
 
 ## Correctness
@@ -290,8 +279,7 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 
 ### Concurrency
 
-- State transitions use optimistic locking (`version`); balance-affecting entries lock the `accounts` rows they touch.
-- Lock order is always by account id ascending, to avoid deadlocks when an entry touches several accounts.
+- State transitions use optimistic locking (`version`). A ledger entry locks every `accounts` row it touches with `SELECT … FOR UPDATE`, always in ascending account id order to avoid deadlocks, and only then computes the new balances.
 - Isolation: `READ COMMITTED` plus explicit row locks; one ledger test runs the suite under `SERIALIZABLE` to catch anomalies. The transaction helper retries on serialization failure (`40001`) and deadlock (`40P01`).
 
 ### Invariants (checked in tests and by a periodic job)
@@ -446,7 +434,7 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 - **Inbound rail webhooks:** verify the ECDSA/SHA-384 `Webhook-Signature` with the rail's public key for that environment; optionally allowlist the rail's IPs. Treat a verified event as a hint: re-fetch the transaction from the rail before moving money.
 - **Outbound rail calls:** request signing (ES384 JWT) on from day one, even though the sandbox does not require it.
 - **Money controls:** per-customer limits and velocity checks, an allowlist of sweep destinations, two-person approval for manual ledger adjustments, and an append-only audit log of every admin action.
-- **Ledger integrity:** postings and journal entries are append-only, with `UPDATE` and `DELETE` revoked from the app role; the only mutable ledger column is `accounts.posted`, and the invariant job checks it against the postings.
+- **Ledger integrity:** append-only journal and a least-privilege app role (see Ledger); the invariant job checks every balance against the postings.
 - **Keys and infrastructure:** least-privilege IAM per ECS service; signing keys never leave KMS; secrets in Secrets Manager.
 - **Code hygiene:** Go fuzz tests on amount parsing and webhook decoding; `gosec`, `govulncheck`, `gitleaks` in CI.
 - **Documents:** `docs/threat-model.md` (STRIDE per component and trust boundary) and `docs/self-audit.md` (findings, severity, fix PRs) — the auditor's view of your own system.
@@ -506,9 +494,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 - Which EVM testnet has a usable USDC faucet (Sepolia vs Base Sepolia)?
 - Does the Noah sandbox send webhooks to a public URL, or is polling needed locally (use a tunnel such as ngrok)?
 - SQS vs NATS for the local default — pick the one closest to what Noah likely runs.
-- ~~Rail fee~~ **Decided:** Noah deducts its fee from Ferry's balance, so the rail fee is credited to `noah_prefunded` as part of settlement. `fees` holds only a Ferry markup, which v1 does not charge.
-- ~~Return shortfall~~ **Decided:** the customer bears it. A bank return credits `available` with the returned amount only. If Ferry ever absorbs shortfalls, add a `return_fees` expense account in a migration.
-- **Treasury top-up:** when and how USDC moves from the omnibus wallet to Noah (debit `noah_prefunded`, credit `chain_omnibus`); manual in v1 until M4.
+- **Treasury top-up:** when and how USDC moves from the omnibus wallet to Noah (the `treasury_topup` entry); manual in v1 until M4.
 
 ## Evolution
 
