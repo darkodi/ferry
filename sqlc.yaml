@@ -1,0 +1,23 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/ledger/queries.sql
+    gen:
+      go:
+        package: ledgerdb
+        out: internal/ledger/ledgerdb
+        sql_package: pgx/v5
+        overrides:
+          # Ledger amounts are numeric(38,0) constrained to the int64 range,
+          # so they map to int64 (never float64).
+          - db_type: pg_catalog.numeric
+            go_type: int64
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: uuid
+            nullable: true
+            go_type:
+              import: github.com/google/uuid
+              type: UUID
+              pointer: true

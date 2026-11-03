@@ -298,7 +298,7 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 
 - Table-driven unit tests for the state machine (every allowed and forbidden transition).
 - Integration tests on real Postgres via `testcontainers-go`.
-- Concurrency test: 100 goroutines submit the same idempotency key, and another 100 overspend one balance; assert one payout and no negative balance.
+- Concurrency test: 100 goroutines submit the same idempotency key, and another 100 overspend one balance; assert one payout and no negative balance. Open every pool connection before releasing the goroutines: otherwise most transactions queue behind connection setup, run one after another, and the race never happens (a version without `FOR UPDATE` passed until this was added).
 - Fault injection: a mock rail that times out, returns 5xx, duplicates webhooks and bounces after acceptance; kill workers mid-step and assert invariants after restart.
 - Property-based tests (`rapid`) generating random sequences of deposits, payouts and failures, checking invariants after each.
 
