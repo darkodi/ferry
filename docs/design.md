@@ -123,6 +123,37 @@ Postings and journal entries cannot be edited or deleted, not by the app and not
 
 A payout is not Ferry's cost: it is the customer's money leaving the system, so settlement reduces a liability (`held`) and an asset (`noah_prefunded`) together.
 
+#### Reading debit and credit
+
+"Debit" and "credit" do not mean "decrease" and "increase". They mean left side and right side of an entry, and what each does to a balance depends on the account's nature:
+
+| Nature | Examples | Debit | Credit |
+| --- | --- | --- | --- |
+| Asset: something Ferry has | `chain_omnibus`, `noah_prefunded` | increases | decreases |
+| Liability: something Ferry owes | `available`, `held` | decreases | increases |
+
+`posted` is always stored as a positive number on the account's own normal side, so a deposit leaves both `chain_omnibus` and `available` at 100 even though one was debited and the other credited. In the code this is `Kind.NormalSide()`.
+
+Effect of each entry type, with the account's nature in brackets:
+
+| Entry type | Account | Direction | Effect |
+| --- | --- | --- | --- |
+| `deposit` | `chain_omnibus` (asset) | debit | up: Ferry has more USDC on-chain |
+| | `available` (liability) | credit | up: Ferry owes the customer more |
+| `treasury_topup` | `noah_prefunded` (asset) | debit | up: more USDC at Noah |
+| | `chain_omnibus` (asset) | credit | down: less USDC on-chain |
+| `hold` | `available` (liability) | debit | down: less spendable |
+| | `held` (liability) | credit | up: more reserved |
+| `settle` | `held` (liability) | debit | down: reservation used up |
+| | `noah_prefunded` (asset) | credit | down: Noah took actual + rail fee |
+| | `available` (liability) | credit | up: unused remainder returns |
+| `release` | `held` (liability) | debit | down |
+| | `available` (liability) | credit | up |
+| `bank_return` | `noah_prefunded` (asset) | debit | up: returned USDC is back at Noah |
+| | `available` (liability) | credit | up: customer is credited |
+
+Each entry balances because debits equal credits in amount, even though some balances go up and some go down.
+
 Each arrow below points from the **debited** account to the **credited** account, the notation used throughout this document. For the house assets it can look backwards: in a `treasury_topup` the arrow points `noah_prefunded → chain_omnibus` because Noah's balance is debited (it grows) and the omnibus is credited (it shrinks), while the coins physically move the other way.
 
 ```mermaid
@@ -200,9 +231,11 @@ If entry 3 were skipped, `noah_prefunded` would go to −49.80 at settlement. Ho
 
 | Table | Purpose |
 | --- | --- |
+| `customers` | A business using Ferry: id, name. Its ledger accounts are opened in the same transaction |
+| `api_keys` | SHA-256 of each customer API key (keys are random 32 bytes, shown once), revoked\_at |
 | `deposits` | Detected on-chain transfers: chain, tx\_hash, log\_index, amount, confirmations, status |
 | `quotes` | Rail price for a payout: fiat amount, authorized crypto amount, fee, expires\_at |
-| `payouts` | The payout state machine: status, quote\_id, rail, attempt, version |
+| `payouts` | The payout state machine: status, version, needs\_resolution, and the client's idempotency key (unique per customer) |
 | `rail_transactions` | One row per rail attempt: nonce, external\_id (= payout id), rail\_tx\_id, status, sub\_status, rfi\_status, last\_event\_version |
 | `outbox` | Events written in the same tx as state changes |
 | `idempotency_keys` | Client key, request hash, response snapshot, locked\_until |
@@ -218,6 +251,7 @@ Each transition and the ledger entry posted with it:
 stateDiagram-v2
     [*] --> created
     created --> quoted: rail prepare, no postings
+    created --> failed: rail refuses to quote, no postings
     quoted --> held: hold
     quoted --> expired: quote lapsed, no postings
     held --> submitted: rail accepts, no postings
@@ -249,6 +283,10 @@ Each step below is one database transaction that changes state, writes ledger po
 4. **Submit.** Worker consumes `payout.held`, creates a `rail_transactions` row with a fresh Nonce (stored *before* the call) and `ExternalID = payout_id`, then calls the rail. On acceptance store the rail transaction id and move to `submitted`; no postings, the funds stay in `held`.
 5. **Wait.** While the rail reports `Pending`, webhooks update sub-status (screening, review, request for information). Each webhook is applied only if its `EventVersion` is newer than the stored one.
 6. **Settle.** Rail reports `Settled`. Post the `settle` entry; move to `settled`; emit `payout.settled`; send customer webhook.
+
+Every rail report, whether from a webhook, a poll or the submit response, goes through one function (`payout.Service.Sync`): it fetches the transaction from the rail and applies only what is newer than the stored `last_event_version`. A webhook only says "look again"; the rail's own answer is what moves money.
+
+Until M3 adds the outbox relay and workers, the API runs steps 4–6 directly after the hold commits, still outside any transaction. The outbox rows are written from M2 on, so M3 only adds the reader.
 
 ### Failure and reversal
 
@@ -466,6 +504,7 @@ ferry/
   cmd/            api, worker, relay, watcher, recon
   internal/
     ledger/       entries, postings, balances, invariants
+    customer/     customers and API keys
     payout/       state machine, service, resolver
     chain/        adapter interface, evm/, solana/
     rail/         adapter interface, noah/, mock/

@@ -28,6 +28,12 @@ linters:
       require-specific: true
     exhaustive:
       default-signifies-exhaustive: false
+    wrapcheck:
+      # Ferry's own packages already wrap errors where they arise; wrapping
+      # them again at every package boundary only repeats the prefix.
+      # Errors from third-party packages must still be wrapped.
+      ignore-package-globs:
+        - github.com/darkodi/ferry/*
   exclusions:
     generated: lax
     rules:

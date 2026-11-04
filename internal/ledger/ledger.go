@@ -206,6 +206,27 @@ func OpenCustomerAccounts(ctx context.Context, db DB, owner uuid.UUID) (Customer
 	return CustomerAccounts{Available: ids[KindAvailable], Held: ids[KindHeld]}, nil
 }
 
+// FindCustomerAccounts returns the ids of a customer's USDC accounts
+// without creating them. It returns ErrUnknownAccount if they were never
+// opened.
+func FindCustomerAccounts(ctx context.Context, db DB, owner uuid.UUID) (CustomerAccounts, error) {
+	q := ledgerdb.New(db)
+	ids := make(map[Kind]AccountID, 2)
+	for _, k := range []Kind{KindAvailable, KindHeld} {
+		id, err := q.CustomerAccountID(ctx, ledgerdb.CustomerAccountIDParams{
+			OwnerID: &owner, Kind: string(k), Currency: string(USDC),
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CustomerAccounts{}, fmt.Errorf("%w: no %s account for %s", ErrUnknownAccount, k, owner)
+		}
+		if err != nil {
+			return CustomerAccounts{}, fmt.Errorf("ledger: find %s account: %w", k, err)
+		}
+		ids[k] = AccountID(id)
+	}
+	return CustomerAccounts{Available: ids[KindAvailable], Held: ids[KindHeld]}, nil
+}
+
 // Balance returns an account's posted balance on its normal side.
 func Balance(ctx context.Context, db DB, id AccountID) (Amount, error) {
 	posted, err := ledgerdb.New(db).AccountBalance(ctx, int64(id))

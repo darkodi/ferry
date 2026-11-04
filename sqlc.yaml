@@ -1,4 +1,5 @@
 version: "2"
+
 sql:
   - engine: postgresql
     schema: migrations
@@ -8,7 +9,7 @@ sql:
         package: ledgerdb
         out: internal/ledger/ledgerdb
         sql_package: pgx/v5
-        overrides:
+        overrides: &overrides
           # Ledger amounts are numeric(38,0) constrained to the int64 range,
           # so they map to int64 (never float64).
           - db_type: pg_catalog.numeric
@@ -21,3 +22,33 @@ sql:
               import: github.com/google/uuid
               type: UUID
               pointer: true
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: time.Time
+              pointer: true
+          - db_type: text
+            nullable: true
+            go_type:
+              type: string
+              pointer: true
+  - engine: postgresql
+    schema: migrations
+    queries: internal/customer/queries.sql
+    gen:
+      go:
+        package: customerdb
+        out: internal/customer/customerdb
+        sql_package: pgx/v5
+        overrides: *overrides
+  - engine: postgresql
+    schema: migrations
+    queries: internal/payout/queries.sql
+    gen:
+      go:
+        package: payoutdb
+        out: internal/payout/payoutdb
+        sql_package: pgx/v5
+        overrides: *overrides
