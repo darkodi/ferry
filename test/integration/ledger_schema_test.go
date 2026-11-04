@@ -302,15 +302,14 @@ func TestCustomerAccountCannotGoNegative(t *testing.T) {
 
 func TestHouseAccountMayGoNegative(t *testing.T) {
 	ctx := context.Background()
-	// Restore afterwards so other tests see the original balance.
-	err := inTx(t, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE accounts SET posted = -49800000 WHERE id = $1`, house["noah_prefunded"])
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, `UPDATE accounts SET posted = 0 WHERE id = $1`, house["noah_prefunded"])
-		return err
-	})
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Roll back: only the UPDATE being accepted is under test, and the real
+	// balance must stay equal to its postings.
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, `UPDATE accounts SET posted = -49800000 WHERE id = $1`, house["noah_prefunded"])
 	requireCode(t, err, codeOK)
 }
 

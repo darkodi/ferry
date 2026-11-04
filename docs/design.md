@@ -2,7 +2,7 @@
 
 ## Overview
 
-**Ferry** is a small, correct-by-construction stablecoin payout engine in Go. A business funds a balance with USDC (EVM testnet or Solana devnet), then requests a fiat payout to a bank account; Ferry quotes it, reserves funds, executes it through a fiat rail, and settles the ledger. It is a portfolio project that mirrors the core of a stablecoin payments platform: orchestration, ledgering, settlement, rail integration, reconciliation.
+**Ferry** is a small stablecoin payout engine in Go. A business funds a balance with USDC (EVM testnet or Solana devnet), then requests a fiat payout to a bank account; Ferry quotes it, reserves funds, executes it through a fiat rail, and settles the ledger. It is a portfolio project that mirrors the core of a stablecoin payments platform: orchestration, ledgering, settlement, rail integration, reconciliation.
 
 ### Goals
 
@@ -17,7 +17,6 @@
 ### Non-goals
 
 - Real funds, mainnet, or production licences.
-- A UI beyond a minimal admin view (optional).
 - Full KYC/KYB. A stub compliance check marks the place where screening would sit.
 - FX engine. Quotes come from the rail; Ferry only stores and enforces them.
 - High availability across regions. One region, horizontally scalable workers.
@@ -40,7 +39,11 @@ flowchart TB
     Recon["Recon, daily<br/>checks Postgres against<br/>chain and rail"] -.-> PG
 ```
 
-The API and watchers write state, postings and outbox rows in one transaction. The relay turns committed rows into SQS events; the worker consumes them, calls the rail, and writes the result back. Recon reads Postgres and compares it with chain and rail data.
+When a request comes in, the API (or a chain watcher that spots a deposit) saves everything in Postgres in one go: the new status, the accounting entries, and a note saying “something needs to happen next.” The note is the outbox row, and it is saved together with the rest, so it can’t be lost.
+
+The relay is a small helper that reads those notes and puts each one on an SQS queue, which is a waiting line for jobs. The worker picks jobs off the queue, calls the payment partner (the rail), and writes the outcome back to Postgres.
+
+Recon is the daily checker. It reads what Ferry has recorded in Postgres and compares it with what the blockchain and the rail report, and it flags any mismatch.
 
 | Binary | Responsibility | Scales by |
 | --- | --- | --- |
@@ -295,7 +298,7 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 
 - Table-driven unit tests for the state machine (every allowed and forbidden transition).
 - Integration tests on real Postgres via `testcontainers-go`.
-- Concurrency test: 100 goroutines submit the same idempotency key, and another 100 overspend one balance; assert one payout and no negative balance.
+- Concurrency test: 100 goroutines submit the same idempotency key, and another 100 overspend one balance; assert one payout and no negative balance. Open every pool connection before releasing the goroutines: otherwise most transactions queue behind connection setup, run one after another, and the race never happens (a version without `FOR UPDATE` passed until this was added).
 - Fault injection: a mock rail that times out, returns 5xx, duplicates webhooks and bounces after acceptance; kill workers mid-step and assert invariants after restart.
 - Property-based tests (`rapid`) generating random sequences of deposits, payouts and failures, checking invariants after each.
 

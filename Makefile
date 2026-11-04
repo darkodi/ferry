@@ -18,7 +18,6 @@ DATABASE_URL      ?= postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:
 # Pinned tool versions. Tools are installed into ./bin (git-ignored) rather than
 # go.mod so they don't pull their dependency trees into the module graph.
 GOLANGCI_LINT_VERSION := v2.15.0
-GOSEC_VERSION         := v2.29.0
 GOVULNCHECK_VERSION   := v1.9.0
 GITLEAKS_VERSION      := v8.30.1
 GOOSE_VERSION         := v3.29.0
@@ -27,7 +26,7 @@ SQLC_VERSION          := v1.31.1
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: help up down migrate migrate-status test lint vet gosec vuln gitleaks sqlc tools
+.PHONY: help up down migrate migrate-status test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -50,11 +49,9 @@ test: ## Unit + integration tests with the race detector
 vet: ## go vet
 	go vet ./...
 
-lint: vet $(BIN)/golangci-lint gosec vuln ## golangci-lint + gosec + govulncheck
+# gosec runs inside golangci-lint (see .golangci.yml), with full type information.
+lint: vet $(BIN)/golangci-lint vuln ## go vet + golangci-lint (incl. gosec) + govulncheck
 	golangci-lint run
-
-gosec: $(BIN)/gosec ## Security static analysis
-	gosec -quiet ./...
 
 vuln: $(BIN)/govulncheck ## Known-vulnerability scan of dependencies
 	govulncheck ./...
@@ -66,12 +63,10 @@ gitleaks: $(BIN)/gitleaks ## Scan git history and working tree for secrets
 sqlc: $(BIN)/sqlc ## Regenerate query code
 	sqlc generate
 
-tools: $(BIN)/golangci-lint $(BIN)/gosec $(BIN)/govulncheck $(BIN)/gitleaks $(BIN)/goose $(BIN)/sqlc ## Install all pinned tools into ./bin
+tools: $(BIN)/golangci-lint $(BIN)/govulncheck $(BIN)/gitleaks $(BIN)/goose $(BIN)/sqlc ## Install all pinned tools into ./bin
 
 $(BIN)/golangci-lint:
 	GOBIN=$(BIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
-$(BIN)/gosec:
-	GOBIN=$(BIN) go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
 $(BIN)/govulncheck:
 	GOBIN=$(BIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 $(BIN)/gitleaks:

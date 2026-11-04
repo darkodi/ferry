@@ -9,10 +9,10 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | Milestone | State |
 | --- | --- |
 | Repo scaffold, CI | done |
-| M1 — Ledger core | in progress: schema, constraints and DB role done; Go posting logic next |
+| M1 — Ledger core | done |
 | M2–M7 | planned |
 
-What works today: `make migrate` creates the ledger schema, and the database itself rejects unbalanced entries, negative customer balances and any edit or delete of posted history. Nothing runs end to end yet.
+What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. There is no API yet (M2), so nothing runs end to end.
 
 ## Run locally
 
