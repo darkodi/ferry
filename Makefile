@@ -26,7 +26,7 @@ SQLC_VERSION          := v1.31.1
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: help up down migrate migrate-status test lint vet vuln gitleaks sqlc tools
+.PHONY: help up down migrate migrate-status run test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -42,6 +42,9 @@ migrate: $(BIN)/goose ## Apply migrations to DATABASE_URL
 
 migrate-status: $(BIN)/goose ## Show migration status
 	goose -dir migrations postgres "$(DATABASE_URL)" status
+
+run: ## Run the API server (reads .env; see .env.example)
+	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/api
 
 test: ## Unit + integration tests with the race detector
 	go test -race -count=1 ./...

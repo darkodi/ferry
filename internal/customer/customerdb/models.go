@@ -35,6 +35,17 @@ type Customer struct {
 	CreatedAt time.Time
 }
 
+type IdempotencyKey struct {
+	CustomerID     uuid.UUID
+	Key            string
+	RequestHash    []byte
+	LockedUntil    *time.Time
+	ResponseStatus pgtype.Int4
+	ResponseBody   []byte
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 type JournalEntry struct {
 	ID              int64
 	IdempotencyKey  string

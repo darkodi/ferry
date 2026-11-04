@@ -52,3 +52,12 @@ sql:
         out: internal/payout/payoutdb
         sql_package: pgx/v5
         overrides: *overrides
+  - engine: postgresql
+    schema: migrations
+    queries: internal/idempotency/queries.sql
+    gen:
+      go:
+        package: idempotencydb
+        out: internal/idempotency/idempotencydb
+        sql_package: pgx/v5
+        overrides: *overrides

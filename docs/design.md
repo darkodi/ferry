@@ -302,9 +302,10 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 
 ### Idempotent API
 
-- Every mutating endpoint requires `Idempotency-Key`. Ferry stores `(key, request_hash, status, response)`.
-- Same key + same hash → return the stored response. Same key + different hash → `422`. Key in flight → `409` with retry-after.
-- The key row is inserted in the same tx as the business row, so a crash leaves either both or neither.
+- Every mutating customer endpoint requires `Idempotency-Key`. Keys are scoped to the customer. Ferry stores `(customer, key, request_hash, locked_until, status, response)`; the hash covers method, path and body.
+- Same key + same hash → return the stored response (header `Idempotent-Replayed: true`). Same key + different hash → `422`. Key in flight → `409` with `Retry-After`.
+- A request claims its key with a 30-second lease before running. Responses below 500 are stored; after a 5xx the key is unlocked so the client can retry at once.
+- The key row is not written in the business transaction: creating a payout calls the rail between two transactions, so there is no single transaction to share. Instead the business tables carry their own unique key (`payouts (customer_id, idempotency_key)`), and confirm is idempotent by state. If Ferry dies after the work but before storing the response, the lease runs out, the retry re-runs the handler, and the handler finds the work already done.
 
 ### Transactional outbox
 
@@ -486,7 +487,7 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/v1/customers` | Create customer + accounts; idempotent |
+| POST | `/v1/customers` | Operator only (admin key). Create customer + accounts; returns the API key once |
 | GET | `/v1/customers/{id}/balances` | Available and held per currency |
 | GET | `/v1/customers/{id}/deposit-addresses` | Per-chain addresses |
 | POST | `/v1/payouts` | Create + quote; requires `Idempotency-Key` |
