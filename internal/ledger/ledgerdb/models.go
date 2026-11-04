@@ -5,6 +5,8 @@
 package ledgerdb
 
 import (
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -15,8 +17,22 @@ type Account struct {
 	Kind      string
 	Currency  string
 	Posted    int64
-	CreatedAt pgtype.Timestamptz
-	UpdatedAt pgtype.Timestamptz
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type ApiKey struct {
+	ID         int64
+	CustomerID uuid.UUID
+	KeyHash    []byte
+	CreatedAt  time.Time
+	RevokedAt  *time.Time
+}
+
+type Customer struct {
+	ID        uuid.UUID
+	Name      string
+	CreatedAt time.Time
 }
 
 type JournalEntry struct {
@@ -25,7 +41,31 @@ type JournalEntry struct {
 	Type            string
 	RefID           *uuid.UUID
 	ReversesEntryID pgtype.Int8
-	CreatedAt       pgtype.Timestamptz
+	CreatedAt       time.Time
+}
+
+type Outbox struct {
+	ID          int64
+	Topic       string
+	AggregateID uuid.UUID
+	Payload     []byte
+	CreatedAt   time.Time
+	PublishedAt *time.Time
+}
+
+type Payout struct {
+	ID              uuid.UUID
+	CustomerID      uuid.UUID
+	IdempotencyKey  string
+	FiatAmount      int64
+	FiatCurrency    string
+	Destination     string
+	Status          string
+	NeedsResolution bool
+	FailureReason   *string
+	Version         int32
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type Posting struct {
@@ -35,4 +75,30 @@ type Posting struct {
 	Currency  string
 	Direction string
 	Amount    int64
+}
+
+type Quote struct {
+	ID               uuid.UUID
+	PayoutID         uuid.UUID
+	Rail             string
+	RailQuoteID      string
+	FiatAmount       int64
+	FiatCurrency     string
+	CryptoAuthorized int64
+	ExpiresAt        time.Time
+	CreatedAt        time.Time
+}
+
+type RailTransaction struct {
+	ID               int64
+	PayoutID         uuid.UUID
+	Attempt          int32
+	Nonce            string
+	ExternalID       string
+	RailTxID         *string
+	Status           string
+	SubStatus        *string
+	LastEventVersion int64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }

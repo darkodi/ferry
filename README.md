@@ -10,9 +10,10 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | --- | --- |
 | Repo scaffold, CI | done |
 | M1 — Ledger core | done |
-| M2–M7 | planned |
+| M2 — Payout API + state machine | in progress: payout core done, HTTP API next |
+| M3–M7 | planned |
 
-What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. There is no API yet (M2), so nothing runs end to end.
+What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. The HTTP API arrives in the next M2 step, so nothing runs end to end from outside yet.
 
 ## Run locally
 
