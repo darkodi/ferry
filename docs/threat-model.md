@@ -8,6 +8,7 @@ STRIDE analysis per component and trust boundary. Each component adds its sectio
 | --- | --- | --- | --- |
 | TB1 | Ferry binaries → Postgres | SQL as the `ferry_app` role | M1 |
 | TB2 | Operator / migrations → Postgres | SQL as the schema owner | M1 |
+| TB3 | Internet → API | HTTPS requests with a customer API key or the operator key | M2 |
 
 Later milestones add the public API, inbound rail webhooks, chain RPC and the queue.
 
@@ -77,3 +78,32 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 - **`needs_resolution` needs a resolver.** Until M3, a payout whose submit timed out stays `held` until it is submitted again by hand.
 - **Rail mismatch is not alerted yet.** `ErrRailMismatch` is returned and logged; the alert arrives with metrics in M6.
 - **`accounts.owner_id` is not a foreign key to `customers`**, so the database alone does not stop accounts for unknown owners. `customer.Create` opens accounts in the same transaction as the customer row.
+
+## Public API (M2)
+
+**Assets:** customer API keys, the operator key, and every action the API can trigger (payouts, dev deposits).
+
+**Assumptions:**
+
+- Anyone on the internet can reach the API (TB3). TLS terminates in front of it (load balancer in M7; local dev is plain HTTP on 127.0.0.1).
+- Customers are authenticated but untrusted: they may send malformed, oversized or replayed requests, or try other customers' ids.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: no or stolen key | Requests without a key, or with a guessed one | Bearer API key on every customer route; keys are 32 random bytes, stored as SHA-256 | `TestAuth` |
+| **S**poofing: operator routes | A customer creates customers or fake deposits | Separate operator key (≥ 32 chars, from env), compared in constant time; customer keys are refused on operator routes and vice versa | `TestAuth` |
+| **T**ampering: duplicate requests | A client retry creates two payouts | `Idempotency-Key` required; 100 identical concurrent requests produce one payout | `TestIdempotencyKey`, `TestConcurrentIdenticalCreates` |
+| **T**ampering: malformed input | Unknown fields, floats for amounts, trailing JSON, bad currency | Strict JSON decoding (`DisallowUnknownFields`, single object), integer minor units, domain validation; amounts returned as decimal strings | `TestInputValidation` |
+| **T**ampering: free money | Dev deposit route used in production | `/v1/dev/*` exists only when `FERRY_ENV=dev`, and needs the operator key | — (route not registered otherwise) |
+| **R**epudiation | "I never sent that payout" | Every request is logged with request id, path, status and idempotency key; payout steps are in the outbox | — |
+| **I**nformation disclosure: enumeration | Probing payout or customer ids | Another customer's resources return 404, the same as ids that do not exist; internal errors return only a request id | `TestAuth` |
+| **D**enial of service | Huge bodies or slow clients | 64 KiB body limit; server read, write and header timeouts | — (rate limits in M7) |
+| **E**levation of privilege | A customer key acting on another customer | The customer id comes from the key, never from the request body | `TestAuth` |
+
+### Residual risks
+
+- **No rate limiting or key rotation yet.** Rate limits and per-key scopes are planned for M7; a leaked key stays valid until `revoked_at` is set by hand.
+- **Operator key is a single shared secret.** Acceptable for a portfolio deployment; a real one would use per-operator credentials and an audit log (M7).
+- **Customer creation is not idempotent.** It is an operator action; a retried call creates a second customer with a new key.
