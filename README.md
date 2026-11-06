@@ -11,9 +11,10 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | Repo scaffold, CI | done |
 | M1 — Ledger core | done |
 | M2 — Payout API + state machine | done |
-| M3–M7 | planned |
+| M3 — Events (outbox relay, workers, resolver) | in progress |
+| M4–M7 | planned |
 
-What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Real chain deposits (M4) and the Noah sandbox (M5) are not wired in yet: deposits come from a dev-only endpoint and the rail is a mock that settles at once.
+What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. `cmd/relay` publishes the outbox to an SQS queue (ElasticMQ locally); the worker that consumes it lands next in M3. Real chain deposits (M4) and the Noah sandbox (M5) are not wired in yet: deposits come from a dev-only endpoint and the rail is a mock that settles at once.
 
 ## Run locally
 
@@ -21,7 +22,7 @@ Requires Go (version in `go.mod`), Docker and make.
 
 ```bash
 cp .env.example .env   # adjust if needed
-make up                # Postgres 16 on 127.0.0.1:5432
+make up                # Postgres 16 on 127.0.0.1:5432, ElasticMQ (SQS) on 127.0.0.1:9324
 make migrate           # apply migrations
 make test              # go test -race ./... (integration tests need Docker; -short skips them)
 make lint              # go vet, golangci-lint, gosec, govulncheck

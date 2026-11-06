@@ -9,6 +9,7 @@ STRIDE analysis per component and trust boundary. Each component adds its sectio
 | TB1 | Ferry binaries → Postgres | SQL as the `ferry_app` role | M1 |
 | TB2 | Operator / migrations → Postgres | SQL as the schema owner | M1 |
 | TB3 | Internet → API | HTTPS requests with a customer API key or the operator key | M2 |
+| TB4 | Ferry binaries ↔ queue | SQS messages (ElasticMQ locally) carrying outbox events | M3 |
 
 Later milestones add the public API, inbound rail webhooks, chain RPC and the queue.
 
@@ -107,3 +108,31 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 - **No rate limiting or key rotation yet.** Rate limits and per-key scopes are planned for M7; a leaked key stays valid until `revoked_at` is set by hand.
 - **Operator key is a single shared secret.** Acceptable for a portfolio deployment; a real one would use per-operator credentials and an audit log (M7).
 - **Customer creation is not idempotent.** It is an operator action; a retried call creates a second customer with a new key.
+
+## Outbox relay and queue (M3)
+
+**Assets:** the events that drive payouts (`payout.held` makes a worker submit to the rail), and their delivery.
+
+**Assumptions:**
+
+- The queue is private infrastructure (TB4). On AWS only Ferry's IAM roles can send to or read from it (M7); locally ElasticMQ is bound to 127.0.0.1.
+- Messages are hints, not authority: a consumer reloads the payout from Postgres and acts only if its state allows it. A message cannot move money by itself.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: forged message | Someone with queue access injects `payout.held` for a payout | Consumers act on the payout's state in Postgres, not on the message body; a payout that is not `held` is skipped, and a held one was already confirmed by its customer | Worker tests (PR 2 of M3) |
+| **T**ampering: duplicates | Relay dies after publishing, before marking | At-least-once delivery by design; same message id on resend; `inbox` dedup plus state checks and the stored rail nonce | `TestRelayRepublishesAfterLostAck`, `TestHandleRunsOnce` |
+| **T**ampering: lost events | Relay crashes mid-batch | Rows stay unpublished until marked; the lease expires and another round sends them | `TestRelayRepublishesAfterLostAck` |
+| **R**epudiation | "The event was never sent" | `outbox.published_at` records when each event left; the row is never deleted | — |
+| **I**nformation disclosure | Queue contents read by others | Payloads carry ids and states only, no keys or bank details; IAM-scoped queue on AWS | — |
+| **D**enial of service: poison message | One bad message blocks the worker forever | After 5 deliveries SQS moves it to the DLQ; a non-empty DLQ alerts (M6) | `TestSQS/poison_message_goes_to_the_DLQ` |
+| **D**enial of service: double publishing | Several relays send the same rows | Rows are claimed with `FOR UPDATE SKIP LOCKED` and a lease, so each relay takes different rows | `TestRelaysDoNotOverlap` |
+| **E**levation of privilege | Relay role changes payouts | The relay only reads outbox rows and updates `published_at`/`claimed_until` (column grants) | Migration grants |
+
+### Residual risks
+
+- **Messages are not signed.** Anyone with queue access can inject or replay messages; they cannot move money a customer did not confirm, but they can trigger extra work. IAM-scoped queues (M7) are the control.
+- **No alert on the DLQ or outbox lag yet.** Metrics and alerts arrive in M6.
+- **Published outbox rows and inbox rows are never pruned.** Archiving or partitioning by time is on the Evolution list.

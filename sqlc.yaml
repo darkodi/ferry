@@ -61,3 +61,12 @@ sql:
         out: internal/idempotency/idempotencydb
         sql_package: pgx/v5
         overrides: *overrides
+  - engine: postgresql
+    schema: migrations
+    queries: internal/outbox/queries.sql
+    gen:
+      go:
+        package: outboxdb
+        out: internal/outbox/outboxdb
+        sql_package: pgx/v5
+        overrides: *overrides

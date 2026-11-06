@@ -237,7 +237,7 @@ If entry 3 were skipped, `noah_prefunded` would go to −49.80 at settlement. Ho
 | `quotes` | Rail price for a payout: fiat amount, authorized crypto amount, fee, expires\_at |
 | `payouts` | The payout state machine: status, version, needs\_resolution, and the client's idempotency key (unique per customer) |
 | `rail_transactions` | One row per rail attempt: nonce, external\_id (= payout id), rail\_tx\_id, status, sub\_status, rfi\_status, last\_event\_version |
-| `outbox` | Events written in the same tx as state changes |
+| `outbox` | Events written in the same tx as state changes; published\_at, and claimed\_until (the relay's lease) |
 | `idempotency_keys` | Client key, request hash, response snapshot, locked\_until |
 | `inbox` | Message ids already processed by each consumer |
 
@@ -310,7 +310,12 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 ### Transactional outbox
 
 - State change, ledger postings and the outbox row commit together.
-- A relay polls `outbox WHERE published_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED`, publishes to SQS (or NATS locally), then marks it published. A crash between publish and mark causes a duplicate, which consumers absorb.
+- The relay works in three steps, and only the middle one leaves Postgres:
+  1. A short transaction claims a batch: it sets a 30-second lease (`claimed_until`) on up to 100 unpublished rows that no other relay holds (`FOR UPDATE SKIP LOCKED`), oldest first.
+  2. It publishes them to SQS (ElasticMQ locally), outside any transaction, so a slow queue never holds a database lock.
+  3. A second short transaction marks them `published_at`.
+- A relay that dies between steps 2 and 3 leaves the lease to run out, and the rows go out again. That duplicate keeps the same message id (the outbox row id), and consumers absorb it. Several relays can run at once; each claims different rows.
+- After `queue.MaxReceives` (5) failed deliveries, SQS moves a message to the queue's DLQ.
 
 ### Idempotent consumers
 
@@ -453,7 +458,7 @@ This table is the section an interviewer will probe; each row should have a test
 | --- | --- | --- |
 | Compute | `docker compose` | ECS Fargate: `api`, `worker`, `relay`, `watcher-evm`, `watcher-sol` as separate services |
 | Database | Postgres 16 | RDS Postgres, Multi-AZ off for cost |
-| Messaging | NATS JetStream or LocalStack SQS | SQS (one queue per consumer) + DLQs |
+| Messaging | ElasticMQ (SQS-compatible, `deploy/elasticmq.conf`) | SQS (one queue per consumer) + DLQs |
 | Scheduling | Cron in a container | EventBridge Scheduler → ECS task for recon |
 | Secrets & keys | `.env` | Secrets Manager; KMS for signing |
 | Chain | Anvil fork + Solana test validator | Public testnet RPC (Alchemy/Helius free tier) |
@@ -536,7 +541,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 
 - Which EVM testnet has a usable USDC faucet (Sepolia vs Base Sepolia)?
 - Does the Noah sandbox send webhooks to a public URL, or is polling needed locally (use a tunnel such as ngrok)?
-- SQS vs NATS for the local default — pick the one closest to what Noah likely runs.
+- ~~SQS vs NATS for the local default~~ Decided in M3: SQS everywhere, with ElasticMQ standing in locally, so there is one queue adapter and the DLQ behaves the same in dev and on AWS.
 - **Treasury top-up:** when and how USDC moves from the omnibus wallet to Noah (the `treasury_topup` entry); manual in v1 until M4.
 
 ## Evolution

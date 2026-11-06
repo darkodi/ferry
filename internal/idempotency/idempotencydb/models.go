@@ -46,6 +46,12 @@ type IdempotencyKey struct {
 	UpdatedAt      time.Time
 }
 
+type Inbox struct {
+	Consumer    string
+	MessageID   string
+	ProcessedAt time.Time
+}
+
 type JournalEntry struct {
 	ID              int64
 	IdempotencyKey  string
@@ -56,12 +62,13 @@ type JournalEntry struct {
 }
 
 type Outbox struct {
-	ID          int64
-	Topic       string
-	AggregateID uuid.UUID
-	Payload     []byte
-	CreatedAt   time.Time
-	PublishedAt *time.Time
+	ID           int64
+	Topic        string
+	AggregateID  uuid.UUID
+	Payload      []byte
+	CreatedAt    time.Time
+	PublishedAt  *time.Time
+	ClaimedUntil *time.Time
 }
 
 type Payout struct {

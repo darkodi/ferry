@@ -18,5 +18,13 @@ services:
       timeout: 3s
       retries: 30
 
+  # SQS-compatible queue. On AWS (M7) this is real SQS with the same queues.
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.7.1
+    ports:
+      - "127.0.0.1:${ELASTICMQ_PORT:-9324}:9324"
+    volumes:
+      - ./deploy/elasticmq.conf:/opt/elasticmq.conf:ro
+
 volumes:
   pgdata:
