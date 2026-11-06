@@ -11,10 +11,10 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | Repo scaffold, CI | done |
 | M1 — Ledger core | done |
 | M2 — Payout API + state machine | done |
-| M3 — Events (outbox relay, workers, resolver) | in progress |
+| M3 — Events (outbox relay, workers, resolver) | done |
 | M4–M7 | planned |
 
-What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. `cmd/relay` publishes the outbox to an SQS queue (ElasticMQ locally); the worker that consumes it lands next in M3. Real chain deposits (M4) and the Noah sandbox (M5) are not wired in yet: deposits come from a dev-only endpoint and the rail is a mock that settles at once.
+What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Real chain deposits (M4) and the Noah sandbox (M5) are not wired in yet: deposits come from a dev-only endpoint and the rail is a mock that settles at once.
 
 ## Run locally
 
@@ -33,7 +33,7 @@ The pinned tool versions are installed into `./bin` on first use.
 
 ### Try a payout
 
-Set `FERRY_ADMIN_KEY` in `.env` (for example `openssl rand -hex 32`) and keep `FERRY_ENV=dev`, then start the server with `make run` and, in another terminal:
+Set `FERRY_ADMIN_KEY` in `.env` (for example `openssl rand -hex 32`) and keep `FERRY_ENV=dev`, then start the server with `make run` (after `make up && make migrate`). In dev it also runs the relay, worker and resolver. In another terminal:
 
 ```bash
 source .env
@@ -52,8 +52,10 @@ curl -s -X POST $B/payouts -H "Authorization: Bearer $KEY" -H "Idempotency-Key: 
   -d '{"fiat_amount":10000,"fiat_currency":"USD","destination":"bank_acct_1"}'
 PID=...
 
-# 4. Confirm: holds 101.50, submits to the mock rail, which settles at once.
+# 4. Confirm: holds 101.50 and returns "held". The worker then submits it to the mock rail,
+#    which settles at once; a moment later the payout shows "settled".
 curl -s -X POST $B/payouts/$PID/confirm -H "Authorization: Bearer $KEY" -H "Idempotency-Key: confirm-1"
+curl -s $B/payouts/$PID -H "Authorization: Bearer $KEY"
 
 # 5. Balances: 99.50 available (100 paid + 0.50 rail fee; the 1.00 buffer came back).
 curl -s $B/customers/$CID/balances -H "Authorization: Bearer $KEY"

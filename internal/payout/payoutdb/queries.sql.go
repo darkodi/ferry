@@ -309,6 +309,44 @@ func (q *Queries) SettleEntryCounts(ctx context.Context) ([]SettleEntryCountsRow
 	return items, nil
 }
 
+const staleInFlight = `-- name: StaleInFlight :many
+SELECT id FROM payouts
+WHERE status = $1
+  AND updated_at <= now() - make_interval(secs => $2::int)
+ORDER BY updated_at
+LIMIT $3
+`
+
+type StaleInFlightParams struct {
+	Status    string
+	StaleSecs int32
+	MaxRows   int32
+}
+
+// Payouts in @status untouched for at least @stale_secs seconds, oldest
+// first. The resolver resubmits stale held payouts (lost event or unknown
+// submit outcome) and re-fetches stale submitted ones (missed webhook).
+// The cut-off uses the database clock, the same clock as updated_at.
+func (q *Queries) StaleInFlight(ctx context.Context, arg StaleInFlightParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, staleInFlight, arg.Status, arg.StaleSecs, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const transition = `-- name: Transition :execrows
 UPDATE payouts
 SET status = $1, failure_reason = $2, needs_resolution = false,

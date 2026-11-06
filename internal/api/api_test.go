@@ -24,7 +24,9 @@ import (
 	"github.com/darkodi/ferry/internal/api"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
+	"github.com/darkodi/ferry/internal/outbox"
 	"github.com/darkodi/ferry/internal/payout"
+	"github.com/darkodi/ferry/internal/platform/queue"
 	"github.com/darkodi/ferry/internal/rail/mock"
 	"github.com/darkodi/ferry/internal/testutil/pgtest"
 )
@@ -32,9 +34,11 @@ import (
 const adminKey = "test-admin-key-0123456789abcdef0123456789"
 
 var (
-	pool *pgxpool.Pool
-	idem *idempotency.Store
-	srv  *httptest.Server
+	pool   *pgxpool.Pool
+	idem   *idempotency.Store
+	srv    *httptest.Server
+	relay  *outbox.Relay
+	worker *payout.Worker
 )
 
 func TestMain(m *testing.M) {
@@ -73,8 +77,12 @@ func run(m *testing.M) int {
 	rl.AutoSettle = true
 	log := slog.New(slog.DiscardHandler)
 	idem = idempotency.NewStore(pool, time.Now, 30*time.Second, log)
+	payouts := payout.NewService(pool, rl, house, time.Now)
+	q := queue.NewMemory()
+	relay = outbox.NewRelay(pool, q, time.Now, log)
+	worker = payout.NewWorker(payouts, q, log)
 	srv = httptest.NewServer(api.New(api.Config{
-		Pool: pool, Payouts: payout.NewService(pool, rl, house, time.Now), Idem: idem,
+		Pool: pool, Payouts: payouts, Idem: idem,
 		House: house, AdminKey: adminKey, Dev: true, Log: log,
 	}))
 	defer srv.Close()
@@ -178,12 +186,31 @@ func TestPayoutEndToEnd(t *testing.T) {
 	pid := p["id"].(string)
 	r = call(t, "POST", "/v1/payouts/"+pid+"/confirm", key, "confirm-1", nil)
 	wantStatus(t, r, http.StatusOK)
-	if s := r.json(t)["status"]; s != "settled" {
-		t.Fatalf("after confirm: status %v, want settled", s)
+	if s := r.json(t)["status"]; s != "held" {
+		t.Fatalf("after confirm: status %v, want held", s)
+	}
+
+	// What runs in the background: the relay publishes payout.held and the
+	// worker submits it; the mock rail settles at once.
+	for {
+		published, err := relay.RunOnce(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		received, err := worker.RunOnce(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if published == 0 && received == 0 {
+			break
+		}
 	}
 
 	r = call(t, "GET", "/v1/payouts/"+pid, key, "", nil)
 	wantStatus(t, r, http.StatusOK)
+	if s := r.json(t)["status"]; s != "settled" {
+		t.Fatalf("after the worker: status %v, want settled", s)
+	}
 
 	r = call(t, "GET", "/v1/customers/"+id+"/balances", key, "", nil)
 	wantStatus(t, r, http.StatusOK)

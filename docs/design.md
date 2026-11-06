@@ -286,7 +286,16 @@ Each step below is one database transaction that changes state, writes ledger po
 
 Every rail report, whether from a webhook, a poll or the submit response, goes through one function (`payout.Service.Sync`): it fetches the transaction from the rail and applies only what is newer than the stored `last_event_version`. A webhook only says "look again"; the rail's own answer is what moves money.
 
-Until M3 adds the outbox relay and workers, the API runs steps 4–6 directly after the hold commits, still outside any transaction. The outbox rows are written from M2 on, so M3 only adds the reader.
+`POST /payouts/{id}/confirm` returns once the hold commits (status `held`). Steps 4–6 run in the background: the relay publishes `payout.held`, the worker (`payout.Worker`) submits it, and the client follows the payout with `GET /payouts/{id}`.
+
+The resolver (`payout.Resolver`) handles payouts that stopped moving. It runs every few seconds and never cancels anything; it only asks the rail again:
+
+- **`held` for over a minute.** The submit event was lost or dead-lettered, or the submit outcome was unknown (`needs_resolution`). The resolver calls `Submit` again, which reuses the stored Nonce.
+- **`submitted` for over a minute.** A webhook may be missing. The resolver calls `Sync`, which re-fetches the transaction and applies anything newer.
+
+A payout under compliance review keeps being re-fetched and stays `submitted`. The cut-off uses the database clock, the same clock that sets `updated_at`.
+
+Until the Noah rail (M5), the mock rail lives in one process's memory. So in dev, `cmd/api` runs the relay, worker and resolver in-process. `cmd/relay` and `cmd/worker` are the deployable binaries once the rail is shared.
 
 ### Failure and reversal
 
@@ -319,7 +328,9 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 
 ### Idempotent consumers
 
-- Each consumer records `(consumer, message_id)` in `inbox` in the same tx as its effect; a duplicate hits the unique key and is acked without work.
+- Each consumer records `(consumer, message_id)` in `inbox` in the same tx as its effect; a duplicate hits the unique key and is acked without work (`inbox.Handle`).
+- The submit worker is the exception: its effect calls the rail between transactions, so the inbox row cannot share a transaction with it. Exactly-once effect comes from two guards. `Submit` acts only on a payout that is still `held`, and a retried submit reuses the stored Nonce. The inbox row, recorded after the work, only lets a duplicate skip early.
+- A delivery is acknowledged only after its work is done. A failure leaves it for redelivery, and after 5 receives it moves to the DLQ (malformed body, unknown payout).
 - Inbound rail webhooks are stored in `inbox` before Ferry answers `2xx`; the rail retries failed deliveries (up to 7 times), so an early `2xx` could lose an event.
 - Webhook order is not guaranteed. Each `rail_transactions` row keeps `last_event_version`; an event with an older or equal `EventVersion` is stored but not applied.
 - Rail calls carry a Nonce generated once per attempt and persisted before the call. Every retry of that attempt reuses it, so the rail cannot create a duplicate. A new attempt (new Nonce) starts only after a confirmed `Failed`.
@@ -531,7 +542,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 
 1. **M1 — Ledger core.** Schema, posting rules, invariants, concurrency tests.
 2. **M2 — Payout API + state machine.** Idempotency, holds, mock rail, failure paths.
-3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver.
+3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
 4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test, sweep.
 5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox.
 6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard.

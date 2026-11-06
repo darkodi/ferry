@@ -43,7 +43,7 @@ migrate: $(BIN)/goose ## Apply migrations to DATABASE_URL
 migrate-status: $(BIN)/goose ## Show migration status
 	goose -dir migrations postgres "$(DATABASE_URL)" status
 
-run: ## Run the API server (reads .env; see .env.example)
+run: ## Run the API (in dev also the relay, worker and resolver; needs `make up`)
 	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/api
 
 relay: ## Run the outbox relay (needs `make up` for the queue)

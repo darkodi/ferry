@@ -165,8 +165,9 @@ func (s *server) getPayout(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// confirmPayout places the hold and, until M3 moves this to a worker,
-// submits to the rail and applies its answer in the same request.
+// confirmPayout places the hold and returns the payout as held. The hold
+// writes a payout.held event; the worker submits it to the rail, and the
+// client follows the payout with GET /v1/payouts/{id}.
 func (s *server) confirmPayout(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -189,14 +190,6 @@ func (s *server) confirmPayout(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.internal(w, r, "confirm payout", err)
 		return
-	}
-	// The hold is committed. A submit problem does not undo it: the payout
-	// stays held (with needs_resolution if the outcome is unknown) and the
-	// response shows that state.
-	if sp, err := s.Payouts.Submit(r.Context(), p.ID); err != nil {
-		s.Log.ErrorContext(r.Context(), "submit payout", "payout_id", p.ID, "error", err)
-	} else {
-		p = sp
 	}
 	writeJSON(w, http.StatusOK, toResp(p))
 }
