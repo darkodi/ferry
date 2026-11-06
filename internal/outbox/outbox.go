@@ -1,6 +1,6 @@
 // Package outbox writes events in the same transaction as the state change
 // they describe, so an event exists if and only if the change committed.
-// The relay that publishes them to a queue arrives in M3.
+// Relay then publishes them to a queue.
 package outbox
 
 import (
