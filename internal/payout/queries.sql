@@ -75,3 +75,14 @@ LEFT JOIN journal_entries e ON e.idempotency_key = 'payout:' || p.id::text || ':
 WHERE p.status IN ('settled', 'reversed')
 GROUP BY p.id
 HAVING count(e.id) <> 1;
+
+-- name: StaleInFlight :many
+-- Payouts in @status untouched for at least @stale_secs seconds, oldest
+-- first. The resolver resubmits stale held payouts (lost event or unknown
+-- submit outcome) and re-fetches stale submitted ones (missed webhook).
+-- The cut-off uses the database clock, the same clock as updated_at.
+SELECT id FROM payouts
+WHERE status = @status
+  AND updated_at <= now() - make_interval(secs => @stale_secs::int)
+ORDER BY updated_at
+LIMIT @max_rows;

@@ -76,7 +76,7 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 ### Residual risks
 
-- **`needs_resolution` needs a resolver.** Until M3, a payout whose submit timed out stays `held` until it is submitted again by hand.
+- ~~**`needs_resolution` needs a resolver.**~~ Resolved in M3: `payout.Resolver` resubmits stale `held` payouts with the stored nonce and re-fetches stale `submitted` ones.
 - **Rail mismatch is not alerted yet.** `ErrRailMismatch` is returned and logged; the alert arrives with metrics in M6.
 - **`accounts.owner_id` is not a foreign key to `customers`**, so the database alone does not stop accounts for unknown owners. `customer.Create` opens accounts in the same transaction as the customer row.
 
@@ -122,7 +122,7 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 | Threat | Example | Mitigation | Verified by |
 | --- | --- | --- | --- |
-| **S**poofing: forged message | Someone with queue access injects `payout.held` for a payout | Consumers act on the payout's state in Postgres, not on the message body; a payout that is not `held` is skipped, and a held one was already confirmed by its customer | Worker tests (PR 2 of M3) |
+| **S**poofing: forged message | Someone with queue access injects `payout.held` for a payout | Consumers act on the payout's state in Postgres, not on the message body; a payout that is not `held` is skipped, and a held one was already confirmed by its customer | `TestWorkerSubmitsOnceForDuplicateEvents` |
 | **T**ampering: duplicates | Relay dies after publishing, before marking | At-least-once delivery by design; same message id on resend; `inbox` dedup plus state checks and the stored rail nonce | `TestRelayRepublishesAfterLostAck`, `TestHandleRunsOnce` |
 | **T**ampering: lost events | Relay crashes mid-batch | Rows stay unpublished until marked; the lease expires and another round sends them | `TestRelayRepublishesAfterLostAck` |
 | **R**epudiation | "The event was never sent" | `outbox.published_at` records when each event left; the row is never deleted | — |
@@ -136,3 +136,28 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 - **Messages are not signed.** Anyone with queue access can inject or replay messages; they cannot move money a customer did not confirm, but they can trigger extra work. IAM-scoped queues (M7) are the control.
 - **No alert on the DLQ or outbox lag yet.** Metrics and alerts arrive in M6.
 - **Published outbox rows and inbox rows are never pruned.** Archiving or partitioning by time is on the Evolution list.
+
+## Payout worker and resolver (M3)
+
+**Assets:** held customer funds and the rail submission, which spends Ferry's pre-funded rail balance.
+
+**Assumptions:**
+
+- The worker trusts nothing in a message except as a pointer: it reloads the payout and acts only on its current state.
+- The rail can time out after accepting a payout. Only the rail's own answer, fetched by Ferry, moves money.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **T**ampering: double submit | Event delivered three times, or worker and resolver submit the same payout at once | Inbox skip; `Submit` acts only on `held`; one attempt row per payout with a stored nonce; rail dedups by nonce; transitions are version-guarded | `TestWorkerSubmitsOnceForDuplicateEvents`, `TestSubmitTimeoutKeepsHoldAndReusesNonce` |
+| **T**ampering: releasing funds the rail may have spent | Timeout treated as failure, hold released, rail pays anyway | An unknown outcome keeps the hold (`needs_resolution`); release only after the rail confirms `Failed` | `TestResolverResolvesUnknownOutcome` |
+| **R**epudiation | "The payout was never sent" | Each rail attempt is a `rail_transactions` row with nonce and rail id; worker and resolver log every outcome with `payout_id` | — |
+| **D**enial of service: stuck payouts | Lost event, missed webhook, poison message | Resolver re-drives stale `held`/`submitted` payouts; bad messages go to the DLQ instead of blocking the queue | `TestResolverWaitsOutReviewThenSettles`, `TestWorkerDeadLettersBadMessages` |
+| **E**levation of privilege: auto-cancel | Resolver gives up on a payout under compliance review and releases funds | The resolver never cancels or releases; only a rail-reported `Failed` releases | `TestResolverWaitsOutReviewThenSettles` |
+
+### Residual risks
+
+- **No SLA alert yet.** A payout stuck in review for days is re-fetched but nobody is paged; the alert on `submitted` beyond SLA comes with metrics in M6.
+- **Resolver polls every stale `submitted` payout each round.** Fine at portfolio scale; at volume it needs backoff per payout (e.g. a `next_sync_at` column).
+- **Dev mode runs everything in the API process.** A crash of the API stops the worker too. Separate binaries are used once the rail is shared (M5).
