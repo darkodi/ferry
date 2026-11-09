@@ -29,10 +29,48 @@ type ApiKey struct {
 	RevokedAt  *time.Time
 }
 
+type ChainBlock struct {
+	Chain  string
+	Number int64
+	Hash   string
+}
+
+type ChainCursor struct {
+	Chain     string
+	LastBlock int64
+	LastHash  string
+	UpdatedAt time.Time
+}
+
 type Customer struct {
 	ID        uuid.UUID
 	Name      string
 	CreatedAt time.Time
+}
+
+type Deposit struct {
+	ID          uuid.UUID
+	Chain       string
+	TxHash      string
+	LogIndex    int64
+	BlockNumber int64
+	BlockHash   string
+	Address     string
+	CustomerID  uuid.UUID
+	Amount      int64
+	Status      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type DepositAddress struct {
+	CustomerID      uuid.UUID
+	Chain           string
+	Address         string
+	DerivationIndex int64
+	Status          string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type IdempotencyKey struct {

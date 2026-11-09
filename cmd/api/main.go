@@ -9,6 +9,8 @@
 //	FERRY_ADDR           listen address (default 127.0.0.1:8080)
 //	FERRY_SQS_QUEUE_URL  dev mode: payout queue (ElasticMQ); empty uses an in-memory queue
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. http://localhost:9324
+//	FERRY_EVM_CHAIN      EVM chain name in the database (default evm-local)
+//	FERRY_EVM_XPUB       account xpub for customer deposit addresses; empty assigns none
 package main
 
 import (
@@ -26,6 +28,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/darkodi/ferry/internal/api"
+	"github.com/darkodi/ferry/internal/chain"
+	"github.com/darkodi/ferry/internal/chain/evm"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
@@ -90,14 +94,20 @@ func run(log *slog.Logger) error {
 		log.Warn("payouts will stay held: no worker runs outside dev mode until the Noah rail (M5)")
 	}
 
+	addresses, err := depositAddresses(ctx, pool, log)
+	if err != nil {
+		return err
+	}
+
 	handler := api.New(api.Config{
-		Pool:     pool,
-		Payouts:  payouts,
-		Idem:     idempotency.NewStore(pool, time.Now, 30*time.Second, log),
-		House:    house,
-		AdminKey: adminKey,
-		Dev:      dev,
-		Log:      log,
+		Pool:      pool,
+		Payouts:   payouts,
+		Idem:      idempotency.NewStore(pool, time.Now, 30*time.Second, log),
+		House:     house,
+		Addresses: addresses,
+		AdminKey:  adminKey,
+		Dev:       dev,
+		Log:       log,
 	})
 	srv := &http.Server{
 		Addr:              addr,
@@ -152,4 +162,31 @@ func startBackground(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool
 	wg.Go(func() { resolver.Run(ctx, 5*time.Second) })
 	log.Info("background started", "relay", true, "worker", true, "resolver", true, "sqs", os.Getenv("FERRY_SQS_QUEUE_URL") != "")
 	return nil
+}
+
+// depositAddresses sets up deposit address assignment from FERRY_EVM_XPUB
+// and gives existing customers an address on any newly configured chain.
+func depositAddresses(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (*chain.Addresses, error) {
+	xpub := os.Getenv("FERRY_EVM_XPUB")
+	if xpub == "" {
+		log.Warn("FERRY_EVM_XPUB not set: new customers get no deposit address")
+		return nil, nil
+	}
+	name := os.Getenv("FERRY_EVM_CHAIN")
+	if name == "" {
+		name = "evm-local"
+	}
+	d, err := evm.NewDeriver(name, xpub)
+	if err != nil {
+		return nil, err
+	}
+	a := chain.NewAddresses(d)
+	n, err := a.Backfill(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("backfill deposit addresses: %w", err)
+	}
+	if n > 0 {
+		log.Info("assigned deposit addresses to existing customers", "count", n, "chain", name)
+	}
+	return a, nil
 }

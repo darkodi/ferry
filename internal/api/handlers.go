@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/customer"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
@@ -35,7 +36,7 @@ func (s *server) createCustomer(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	c, key, err := customer.Create(r.Context(), s.Pool, req.Name)
+	c, key, err := customer.Create(r.Context(), s.Pool, req.Name, s.Addresses.Assign)
 	if errors.Is(err, customer.ErrInvalidName) {
 		writeError(w, r, http.StatusUnprocessableEntity, "invalid_request", err.Error())
 		return
@@ -54,12 +55,8 @@ type balancesResp struct {
 }
 
 func (s *server) balances(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	id, ok := s.ownCustomer(w, r)
 	if !ok {
-		return
-	}
-	if id != customerOf(r) { // never reveal whether another customer exists
-		writeError(w, r, http.StatusNotFound, "not_found", "not found")
 		return
 	}
 	resp, err := s.loadBalances(r, id)
@@ -68,6 +65,80 @@ func (s *server) balances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ownCustomer returns the {id} path parameter if it is the caller's own
+// customer id. Any other id gets 404, never revealing whether it exists.
+func (s *server) ownCustomer(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return uuid.Nil, false
+	}
+	if id != customerOf(r) {
+		writeError(w, r, http.StatusNotFound, "not_found", "not found")
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+type depositAddressResp struct {
+	Chain   string `json:"chain"`
+	Address string `json:"address"`
+	// "active", or "provisioning" until the address can receive funds.
+	Status string `json:"status"`
+}
+
+func (s *server) depositAddresses(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.ownCustomer(w, r)
+	if !ok {
+		return
+	}
+	addrs, err := chain.CustomerAddresses(r.Context(), s.Pool, id)
+	if err != nil {
+		s.internal(w, r, "deposit addresses", err)
+		return
+	}
+	out := make([]depositAddressResp, len(addrs))
+	for i, a := range addrs {
+		out[i] = depositAddressResp{Chain: a.Chain, Address: a.Address, Status: a.Status}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deposit_addresses": out})
+}
+
+type depositResp struct {
+	ID          uuid.UUID `json:"id"`
+	Chain       string    `json:"chain"`
+	TxHash      string    `json:"tx_hash"`
+	LogIndex    int64     `json:"log_index"`
+	BlockNumber int64     `json:"block_number"`
+	Address     string    `json:"address"`
+	Amount      string    `json:"amount"`
+	// "pending" (seen, not yet final), "confirmed" (credited) or
+	// "orphaned" (its block was replaced; never credited).
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (s *server) deposits(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.ownCustomer(w, r)
+	if !ok {
+		return
+	}
+	ds, err := chain.CustomerDeposits(r.Context(), s.Pool, id, 100)
+	if err != nil {
+		s.internal(w, r, "deposits", err)
+		return
+	}
+	out := make([]depositResp, len(ds))
+	for i, d := range ds {
+		out[i] = depositResp{
+			ID: d.ID, Chain: d.Chain, TxHash: d.TxHash, LogIndex: d.LogIndex, BlockNumber: d.BlockNumber,
+			Address: d.Address, Amount: ledger.Amount(d.Amount).String(), Status: d.Status,
+			CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deposits": out})
 }
 
 func (s *server) loadBalances(r *http.Request, id uuid.UUID) (balancesResp, error) {

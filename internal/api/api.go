@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/customer"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
@@ -32,6 +33,9 @@ type Config struct {
 	Payouts *payout.Service
 	Idem    *idempotency.Store
 	House   ledger.HouseAccounts
+	// Addresses assigns deposit addresses to new customers. Nil assigns
+	// none (no chain configured).
+	Addresses *chain.Addresses
 	// AdminKey authorises operator routes (creating customers, dev
 	// deposits). Compared in constant time; must be long and random.
 	AdminKey string
@@ -63,6 +67,8 @@ func New(cfg Config) http.Handler {
 		r.Group(func(r chi.Router) { // customer
 			r.Use(s.requireCustomer)
 			r.Get("/customers/{id}/balances", s.balances)
+			r.Get("/customers/{id}/deposit-addresses", s.depositAddresses)
+			r.Get("/customers/{id}/deposits", s.deposits)
 			r.Get("/payouts/{id}", s.getPayout)
 			r.Group(func(r chi.Router) {
 				r.Use(cfg.Idem.Middleware(customerOf, writeError))
