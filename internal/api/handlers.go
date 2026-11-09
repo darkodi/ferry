@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/customer"
+	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
 	"github.com/darkodi/ferry/internal/platform/db"
@@ -160,9 +162,9 @@ func (s *server) loadBalances(r *http.Request, id uuid.UUID) (balancesResp, erro
 // ---- payouts ----
 
 type createPayoutReq struct {
-	FiatAmount   int64  `json:"fiat_amount"` // minor units, e.g. cents
-	FiatCurrency string `json:"fiat_currency"`
-	Destination  string `json:"destination"`
+	FiatAmount    int64     `json:"fiat_amount"` // minor units, e.g. cents
+	FiatCurrency  string    `json:"fiat_currency"`
+	DestinationID uuid.UUID `json:"destination_id"`
 }
 
 type quoteResp struct {
@@ -175,7 +177,7 @@ type payoutResp struct {
 	Status          string     `json:"status"`
 	FiatAmount      int64      `json:"fiat_amount"`
 	FiatCurrency    string     `json:"fiat_currency"`
-	Destination     string     `json:"destination"`
+	DestinationID   *uuid.UUID `json:"destination_id,omitempty"`
 	Quote           *quoteResp `json:"quote,omitempty"`
 	NeedsResolution bool       `json:"needs_resolution"`
 	FailureReason   string     `json:"failure_reason,omitempty"`
@@ -186,9 +188,12 @@ type payoutResp struct {
 func toResp(p payout.Payout) payoutResp {
 	out := payoutResp{
 		ID: p.ID, Status: string(p.Status),
-		FiatAmount: p.FiatAmount, FiatCurrency: p.FiatCurrency, Destination: p.Destination,
+		FiatAmount: p.FiatAmount, FiatCurrency: p.FiatCurrency,
 		NeedsResolution: p.NeedsResolution, FailureReason: p.FailureReason,
 		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+	}
+	if p.DestinationID != uuid.Nil {
+		out.DestinationID = &p.DestinationID
 	}
 	if p.Quote != nil {
 		out.Quote = &quoteResp{CryptoAuthorized: p.Quote.CryptoAuthorized.String(), ExpiresAt: p.Quote.ExpiresAt}
@@ -206,11 +211,13 @@ func (s *server) createPayout(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 		FiatAmount:     req.FiatAmount,
 		FiatCurrency:   req.FiatCurrency,
-		Destination:    req.Destination,
+		DestinationID:  req.DestinationID,
 	})
 	switch {
-	case errors.Is(err, payout.ErrInvalidRequest):
+	case errors.Is(err, payout.ErrInvalidRequest), errors.Is(err, destination.ErrInvalid):
 		writeError(w, r, http.StatusUnprocessableEntity, "invalid_request", err.Error())
+	case errors.Is(err, destination.ErrNotFound):
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_request", "unknown destination_id")
 	case errors.Is(err, payout.ErrKeyReused):
 		writeError(w, r, http.StatusUnprocessableEntity, "idempotency_key_reused", err.Error())
 	case err != nil:
@@ -263,6 +270,70 @@ func (s *server) confirmPayout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toResp(p))
+}
+
+// ---- destinations ----
+
+type createDestinationReq struct {
+	Country           string          `json:"country"`
+	FiatCurrency      string          `json:"fiat_currency"`
+	PaymentMethodType string          `json:"payment_method_type"`
+	Form              json.RawMessage `json:"form"` // the rail's bank-details form; never echoed back
+}
+
+type destinationResp struct {
+	ID                uuid.UUID `json:"id"`
+	Country           string    `json:"country"`
+	FiatCurrency      string    `json:"fiat_currency"`
+	PaymentMethodType string    `json:"payment_method_type"`
+	Display           string    `json:"display"` // masked, e.g. "BankAch ****5678"
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+func toDestinationResp(d destination.Destination) destinationResp {
+	return destinationResp{
+		ID: d.ID, Country: d.Country, FiatCurrency: d.FiatCurrency,
+		PaymentMethodType: d.PaymentMethodType, Display: d.Display, Status: d.Status, CreatedAt: d.CreatedAt,
+	}
+}
+
+// createDestination saves a bank account. The bank details are encrypted
+// before storage and never returned; the response (which the idempotency
+// store keeps) holds only the masked display.
+func (s *server) createDestination(w http.ResponseWriter, r *http.Request) {
+	var req createDestinationReq
+	if !decode(w, r, &req) {
+		return
+	}
+	d, err := s.Destinations.Create(r.Context(), destination.CreateRequest{
+		CustomerID:        customerOf(r),
+		Country:           req.Country,
+		FiatCurrency:      req.FiatCurrency,
+		PaymentMethodType: req.PaymentMethodType,
+		Form:              req.Form,
+	})
+	switch {
+	case errors.Is(err, destination.ErrInvalid):
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_request", err.Error())
+	case err != nil:
+		s.internal(w, r, "create destination", err)
+	default:
+		writeJSON(w, http.StatusCreated, toDestinationResp(d))
+	}
+}
+
+func (s *server) listDestinations(w http.ResponseWriter, r *http.Request) {
+	ds, err := s.Destinations.List(r.Context(), customerOf(r))
+	if err != nil {
+		s.internal(w, r, "list destinations", err)
+		return
+	}
+	out := make([]destinationResp, len(ds))
+	for i, d := range ds {
+		out[i] = toDestinationResp(d)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"destinations": out})
 }
 
 // ---- dev ----

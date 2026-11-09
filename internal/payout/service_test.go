@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/darkodi/ferry/internal/customer"
+	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
 	"github.com/darkodi/ferry/internal/platform/db"
@@ -32,7 +33,10 @@ var (
 	house ledger.HouseAccounts
 	rl    *mock.Rail
 	svc   *payout.Service
-	clk   = &clock{t: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)}
+	dests *destination.Store
+	// usdDest maps a test customer to its USD bank account.
+	usdDest sync.Map
+	clk     = &clock{t: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)}
 )
 
 // clock is a test clock that only moves when told to.
@@ -74,7 +78,11 @@ func run(m *testing.M) int {
 		return 1
 	}
 	rl = mock.New(clk.Now)
-	svc = payout.NewService(pool, rl, house, clk.Now)
+	if dests, err = destination.NewStore(pool, "mock", make([]byte, destination.KeySize)); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	svc = payout.NewService(pool, rl, dests, house, clk.Now)
 	return m.Run()
 }
 
@@ -107,8 +115,27 @@ func newCustomer(t *testing.T, funds string) customer.Customer {
 	if err != nil {
 		t.Fatal(err)
 	}
+	usdDest.Store(c.ID, newDestination(t, c, "USD"))
 	t.Cleanup(func() { checkInvariants(t) })
 	return c
+}
+
+// newDestination registers a test bank account for c.
+func newDestination(t *testing.T, c customer.Customer, currency string) uuid.UUID {
+	t.Helper()
+	d, err := dests.Create(context.Background(), destination.CreateRequest{
+		CustomerID: c.ID, Country: "US", FiatCurrency: currency, PaymentMethodType: "BankAch",
+		Form: []byte(`{"BankDetails":{"AccountNumber":"12345678","BankCode":"123456789"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d.ID
+}
+
+func destOf(c customer.Customer) uuid.UUID {
+	id, _ := usdDest.Load(c.ID)
+	return id.(uuid.UUID)
 }
 
 // create starts a USD payout of the given cents.
@@ -116,7 +143,7 @@ func create(t *testing.T, c customer.Customer, cents int64) payout.Payout {
 	t.Helper()
 	p, err := svc.Create(context.Background(), payout.CreateRequest{
 		CustomerID: c.ID, IdempotencyKey: uuid.NewString(),
-		FiatAmount: cents, FiatCurrency: "USD", Destination: "bank_acct_1",
+		FiatAmount: cents, FiatCurrency: "USD", DestinationID: destOf(c),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +275,7 @@ func TestReplayedCreateReturnsSamePayout(t *testing.T) {
 	c := newCustomer(t, "10")
 	req := payout.CreateRequest{
 		CustomerID: c.ID, IdempotencyKey: "order-42",
-		FiatAmount: 5_00, FiatCurrency: "USD", Destination: "bank_acct_1",
+		FiatAmount: 5_00, FiatCurrency: "USD", DestinationID: destOf(c),
 	}
 	first, err := svc.Create(context.Background(), req)
 	if err != nil {
@@ -272,7 +299,7 @@ func TestQuoteRefused(t *testing.T) {
 	c := newCustomer(t, "10")
 	p, err := svc.Create(context.Background(), payout.CreateRequest{
 		CustomerID: c.ID, IdempotencyKey: uuid.NewString(),
-		FiatAmount: 5_00, FiatCurrency: "EUR", Destination: "bank_acct_1",
+		FiatAmount: 5_00, FiatCurrency: "EUR", DestinationID: newDestination(t, c, "EUR"),
 	})
 	if err != nil {
 		t.Fatal(err)

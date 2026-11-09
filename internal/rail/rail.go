@@ -5,6 +5,7 @@ package rail
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -38,7 +39,21 @@ type QuoteRequest struct {
 	PayoutID     uuid.UUID
 	FiatAmount   int64 // minor units, e.g. cents
 	FiatCurrency string
-	Destination  string // the rail's id for the bank account
+	Destination  Destination
+}
+
+// Destination is the bank account a payout goes to, as the customer
+// registered it. Form holds the bank details in the rail's own shape;
+// it is sensitive and must never be logged.
+type Destination struct {
+	ID                uuid.UUID
+	Country           string // ISO 3166-1 alpha-2
+	FiatCurrency      string
+	PaymentMethodType string // e.g. BankAch
+	Form              json.RawMessage
+	// PaymentMethodID is the rail's saved payment method for this
+	// account, once a payout has settled to it; empty before.
+	PaymentMethodID string
 }
 
 // Quote is the rail's price.
@@ -77,6 +92,9 @@ type Tx struct {
 	Fee   ledger.Amount
 	// Return is set when the bank sent a settled payout back.
 	Return *Return
+	// PaymentMethodID is the rail's saved payment method the payout went
+	// to, if the rail reports one; Ferry reuses it for later payouts.
+	PaymentMethodID string
 }
 
 // Return is a bank return of a settled payout, reported by the rail as a

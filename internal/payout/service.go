@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"regexp"
 	"time"
-	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -40,11 +39,15 @@ var errLost = errors.New("payout: lost race")
 
 // Payout is a request to pay fiat to a bank account from a customer's USDC.
 type Payout struct {
-	ID              uuid.UUID
-	CustomerID      uuid.UUID
-	IdempotencyKey  string
-	FiatAmount      int64 // minor units
-	FiatCurrency    string
+	ID             uuid.UUID
+	CustomerID     uuid.UUID
+	IdempotencyKey string
+	FiatAmount     int64 // minor units
+	FiatCurrency   string
+	// DestinationID is the saved bank account (internal/destination).
+	// Payouts made before destinations existed have uuid.Nil and keep
+	// their free-text Destination.
+	DestinationID   uuid.UUID
 	Destination     string
 	Status          State
 	NeedsResolution bool
@@ -72,7 +75,22 @@ type CreateRequest struct {
 	IdempotencyKey string
 	FiatAmount     int64 // minor units
 	FiatCurrency   string
-	Destination    string
+	DestinationID  uuid.UUID
+}
+
+// Destinations is where payouts find their bank accounts
+// (destination.Store).
+type Destinations interface {
+	// Check returns nil if the customer may pay out to destination id in
+	// currency, and otherwise an error saying why (Create returns it
+	// unchanged).
+	Check(ctx context.Context, customerID, id uuid.UUID, currency string) error
+	// ForQuote returns the destination with its bank details for the
+	// rail's quote.
+	ForQuote(ctx context.Context, customerID, id uuid.UUID) (rail.Destination, error)
+	// RememberPaymentMethod stores the rail's saved payment method for a
+	// destination, inside the caller's transaction.
+	RememberPaymentMethod(ctx context.Context, tx pgx.Tx, id uuid.UUID, paymentMethodID string) error
 }
 
 // Service runs payouts. Each step is one database transaction that changes
@@ -81,13 +99,14 @@ type CreateRequest struct {
 type Service struct {
 	pool  *pgxpool.Pool
 	rail  rail.Rail
+	dests Destinations
 	house ledger.HouseAccounts
 	now   func() time.Time
 }
 
 // NewService returns a Service. now is the clock used for quote expiry.
-func NewService(pool *pgxpool.Pool, r rail.Rail, house ledger.HouseAccounts, now func() time.Time) *Service {
-	return &Service{pool: pool, rail: r, house: house, now: now}
+func NewService(pool *pgxpool.Pool, r rail.Rail, dests Destinations, house ledger.HouseAccounts, now func() time.Time) *Service {
+	return &Service{pool: pool, rail: r, dests: dests, house: house, now: now}
 }
 
 var currencyRE = regexp.MustCompile(`^[A-Z]{3}$`)
@@ -102,19 +121,10 @@ func (r CreateRequest) validate() error {
 		return fmt.Errorf("%w: fiat amount must be positive", ErrInvalidRequest)
 	case !currencyRE.MatchString(r.FiatCurrency):
 		return fmt.Errorf("%w: fiat currency must be three capital letters", ErrInvalidRequest)
-	case len(r.Destination) < 1 || len(r.Destination) > 200 || !printable(r.Destination):
-		return fmt.Errorf("%w: destination must be 1-200 printable characters", ErrInvalidRequest)
+	case r.DestinationID == uuid.Nil:
+		return fmt.Errorf("%w: destination_id required", ErrInvalidRequest)
 	}
 	return nil
-}
-
-func printable(s string) bool {
-	for _, r := range s {
-		if !unicode.IsPrint(r) {
-			return false
-		}
-	}
-	return true
 }
 
 // Create records a payout and quotes it. Calling it again with the same
@@ -123,6 +133,9 @@ func printable(s string) bool {
 // fails with ErrKeyReused.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (Payout, error) {
 	if err := req.validate(); err != nil {
+		return Payout{}, err
+	}
+	if err := s.dests.Check(ctx, req.CustomerID, req.DestinationID, req.FiatCurrency); err != nil {
 		return Payout{}, err
 	}
 	var id uuid.UUID
@@ -134,7 +147,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Payout, error)
 			IdempotencyKey: req.IdempotencyKey,
 			FiatAmount:     req.FiatAmount,
 			FiatCurrency:   req.FiatCurrency,
-			Destination:    req.Destination,
+			Destination:    req.DestinationID.String(),
+			DestinationID:  &req.DestinationID,
 		})
 		if errors.Is(err, pgx.ErrNoRows) { // key already used: return that payout
 			id, err = q.PayoutByKey(ctx, payoutdb.PayoutByKeyParams{
@@ -158,7 +172,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Payout, error)
 	if err != nil {
 		return Payout{}, err
 	}
-	if p.FiatAmount != req.FiatAmount || p.FiatCurrency != req.FiatCurrency || p.Destination != req.Destination {
+	if p.FiatAmount != req.FiatAmount || p.FiatCurrency != req.FiatCurrency || p.DestinationID != req.DestinationID {
 		return Payout{}, ErrKeyReused
 	}
 	if p.Status != Created {
@@ -171,11 +185,18 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Payout, error)
 // rail refuses, the payout fails; on any other error it stays created and a
 // retried Create resumes here.
 func (s *Service) quote(ctx context.Context, p Payout) (Payout, error) {
+	if p.DestinationID == uuid.Nil {
+		return s.step(ctx, p, Failed, "no saved destination", nil)
+	}
+	dest, err := s.dests.ForQuote(ctx, p.CustomerID, p.DestinationID)
+	if err != nil {
+		return p, fmt.Errorf("payout: destination for quote: %w", err)
+	}
 	rq, err := s.rail.Prepare(ctx, rail.QuoteRequest{
 		PayoutID:     p.ID,
 		FiatAmount:   p.FiatAmount,
 		FiatCurrency: p.FiatCurrency,
-		Destination:  p.Destination,
+		Destination:  dest,
 	})
 	if errors.Is(err, rail.ErrRejected) {
 		return s.step(ctx, p, Failed, "quote refused: "+err.Error(), nil)
@@ -390,11 +411,16 @@ func (s *Service) Sync(ctx context.Context, id uuid.UUID) (Payout, error) {
 // the last one applied are ignored, so duplicate and out-of-order
 // deliveries change nothing.
 func (s *Service) apply(ctx context.Context, p Payout, row payoutdb.RailTransaction, rtx rail.Tx) (Payout, error) {
-	if rtx.Version <= row.LastEventVersion {
-		return p, nil
-	}
 	if rtx.ExternalID != p.ID.String() {
 		return p, fmt.Errorf("%w: rail tx %s belongs to %q", ErrRailMismatch, rtx.ID, rtx.ExternalID)
+	}
+	switch {
+	case rtx.Version < row.LastEventVersion:
+		return p, nil
+	case rtx.Version == row.LastEventVersion:
+		// Same progress, maybe a new sub-status (a review moving on).
+		// Recorded for visibility; it never moves money.
+		return p, s.recordSubStatus(ctx, row, rtx)
 	}
 	record := func(tx pgx.Tx) error {
 		sub := &rtx.SubStatus
@@ -427,7 +453,13 @@ func (s *Service) apply(ctx context.Context, p Payout, row payoutdb.RailTransact
 			if err := record(tx); err != nil {
 				return err
 			}
-			return post(ctx, tx, e)
+			if err := post(ctx, tx, e); err != nil {
+				return err
+			}
+			if p.DestinationID == uuid.Nil || rtx.PaymentMethodID == "" {
+				return nil
+			}
+			return s.dests.RememberPaymentMethod(ctx, tx, p.DestinationID, rtx.PaymentMethodID)
 		})
 		if err != nil || p.Status != Settled || rtx.Return == nil {
 			return p, err
@@ -452,6 +484,26 @@ func (s *Service) apply(ctx context.Context, p Payout, row payoutdb.RailTransact
 		}
 		return s.load(ctx, p.ID)
 	}
+}
+
+// recordSubStatus stores a sub-status reported at the version already
+// applied. A different status at the same version would contradict the
+// rail's own ordering and is ignored.
+func (s *Service) recordSubStatus(ctx context.Context, row payoutdb.RailTransaction, rtx rail.Tx) error {
+	if string(rtx.Status) != row.Status {
+		return nil
+	}
+	var sub *string
+	if rtx.SubStatus != "" {
+		sub = &rtx.SubStatus
+	}
+	_, err := payoutdb.New(s.pool).UpdateRailSubStatus(ctx, payoutdb.UpdateRailSubStatusParams{
+		ID: row.ID, SubStatus: sub, EventVersion: rtx.Version,
+	})
+	if err != nil {
+		return fmt.Errorf("payout: record sub-status: %w", err)
+	}
+	return nil
 }
 
 // reverse books a bank return (settled -> reversed), crediting only the
@@ -553,6 +605,9 @@ func (s *Service) load(ctx context.Context, id uuid.UUID) (Payout, error) {
 	}
 	if r.FailureReason != nil {
 		p.FailureReason = *r.FailureReason
+	}
+	if r.DestinationID != nil {
+		p.DestinationID = *r.DestinationID
 	}
 	qr, err := q.GetQuote(ctx, id)
 	switch {

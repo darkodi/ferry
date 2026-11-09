@@ -24,6 +24,7 @@ import (
 	"github.com/darkodi/ferry/internal/api"
 	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/chain/evm"
+	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
@@ -79,7 +80,12 @@ func run(m *testing.M) int {
 	rl.AutoSettle = true
 	log := slog.New(slog.DiscardHandler)
 	idem = idempotency.NewStore(pool, time.Now, 30*time.Second, log)
-	payouts := payout.NewService(pool, rl, house, time.Now)
+	dests, err := destination.NewStore(pool, rl.Name(), make([]byte, destination.KeySize))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	payouts := payout.NewService(pool, rl, dests, house, time.Now)
 	// Account m/44'/60'/1' of the public test mnemonic, as in .env.example.
 	deriver, err := evm.NewDeriver("evm-local", "xpub6Ce9NcJvTk372KjsGfWqbcex5DumjpNquQLApoeQUavSCjEc823BV1tb4rXUuPuht8h2hSxkg2EXUaKUJmniJvRZAELxypsCzBFdtosmV76")
 	if err != nil {
@@ -90,7 +96,7 @@ func run(m *testing.M) int {
 	relay = outbox.NewRelay(pool, q, time.Now, log)
 	worker = payout.NewWorker(payouts, q, log)
 	srv = httptest.NewServer(api.New(api.Config{
-		Pool: pool, Payouts: payouts, Idem: idem,
+		Pool: pool, Payouts: payouts, Destinations: dests, Idem: idem,
 		House: house, Addresses: chain.NewAddresses(deriver), AdminKey: adminKey, Dev: true, Log: log,
 	}))
 	defer srv.Close()
@@ -174,14 +180,32 @@ func newCustomer(t *testing.T, funds string) (id, key string) {
 	return id, key
 }
 
-var payoutBody = map[string]any{"fiat_amount": 100_00, "fiat_currency": "USD", "destination": "bank_acct_1"}
+// bankForm is a BankAch form as the Noah docs show it.
+const bankForm = `{"AccountHolderAddress":{"Address":"1 Main St","City":"New York","State":"NY","PostalCode":"10001"},` +
+	`"BankDetails":{"AccountNumber":"12345678","BankCode":"123456789","AccountType":"Checking"},"PaymentPurpose":"Invoice"}`
+
+// newDestination registers a USD bank account through the API.
+func newDestination(t *testing.T, key string) string {
+	t.Helper()
+	r := call(t, "POST", "/v1/destinations", key, uuid.NewString(), map[string]any{
+		"country": "US", "fiat_currency": "USD", "payment_method_type": "BankAch", "form": json.RawMessage(bankForm),
+	})
+	wantStatus(t, r, http.StatusCreated)
+	return r.json(t)["id"].(string)
+}
+
+// payoutBody is a payout of cents USD to dest.
+func payoutBody(dest string, cents int64) map[string]any {
+	return map[string]any{"fiat_amount": cents, "fiat_currency": "USD", "destination_id": dest}
+}
 
 // ---- tests ----
 
 func TestPayoutEndToEnd(t *testing.T) {
 	id, key := newCustomer(t, "200")
+	dest := newDestination(t, key)
 
-	r := call(t, "POST", "/v1/payouts", key, "order-1", payoutBody)
+	r := call(t, "POST", "/v1/payouts", key, "order-1", payoutBody(dest, 100_00))
 	wantStatus(t, r, http.StatusCreated)
 	p := r.json(t)
 	if p["status"] != "quoted" {
@@ -231,9 +255,7 @@ func TestPayoutEndToEnd(t *testing.T) {
 func TestAuth(t *testing.T) {
 	aID, aKey := newCustomer(t, "10")
 	_, bKey := newCustomer(t, "10")
-	r := call(t, "POST", "/v1/payouts", aKey, uuid.NewString(), map[string]any{
-		"fiat_amount": 1_00, "fiat_currency": "USD", "destination": "bank_acct_1",
-	})
+	r := call(t, "POST", "/v1/payouts", aKey, uuid.NewString(), payoutBody(newDestination(t, aKey), 1_00))
 	wantStatus(t, r, http.StatusCreated)
 	pid := r.json(t)["id"].(string)
 
@@ -261,17 +283,22 @@ func TestAuth(t *testing.T) {
 
 func TestInputValidation(t *testing.T) {
 	_, key := newCustomer(t, "")
+	dest := newDestination(t, key)
 	for _, tc := range []struct {
 		name string
 		body any
 		want int
 	}{
-		{"unknown field", `{"fiat_amount":100,"fiat_currency":"USD","destination":"b","memo":"x"}`, http.StatusBadRequest},
-		{"fractional amount", `{"fiat_amount":1.5,"fiat_currency":"USD","destination":"b"}`, http.StatusBadRequest},
-		{"amount as string", `{"fiat_amount":"100","fiat_currency":"USD","destination":"b"}`, http.StatusBadRequest},
-		{"trailing data", `{"fiat_amount":100,"fiat_currency":"USD","destination":"b"} {}`, http.StatusBadRequest},
-		{"negative amount", `{"fiat_amount":-100,"fiat_currency":"USD","destination":"b"}`, http.StatusUnprocessableEntity},
-		{"bad currency", `{"fiat_amount":100,"fiat_currency":"usd","destination":"b"}`, http.StatusUnprocessableEntity},
+		{"unknown field", `{"fiat_amount":100,"fiat_currency":"USD","destination_id":"` + dest + `","memo":"x"}`, http.StatusBadRequest},
+		{"old destination field", `{"fiat_amount":100,"fiat_currency":"USD","destination":"bank_acct_1"}`, http.StatusBadRequest},
+		{"fractional amount", `{"fiat_amount":1.5,"fiat_currency":"USD","destination_id":"` + dest + `"}`, http.StatusBadRequest},
+		{"amount as string", `{"fiat_amount":"100","fiat_currency":"USD","destination_id":"` + dest + `"}`, http.StatusBadRequest},
+		{"trailing data", `{"fiat_amount":100,"fiat_currency":"USD","destination_id":"` + dest + `"} {}`, http.StatusBadRequest},
+		{"negative amount", `{"fiat_amount":-100,"fiat_currency":"USD","destination_id":"` + dest + `"}`, http.StatusUnprocessableEntity},
+		{"bad currency", `{"fiat_amount":100,"fiat_currency":"usd","destination_id":"` + dest + `"}`, http.StatusUnprocessableEntity},
+		{"no destination", `{"fiat_amount":100,"fiat_currency":"USD"}`, http.StatusUnprocessableEntity},
+		{"unknown destination", `{"fiat_amount":100,"fiat_currency":"USD","destination_id":"` + uuid.NewString() + `"}`, http.StatusUnprocessableEntity},
+		{"currency the destination does not pay", `{"fiat_amount":100,"fiat_currency":"EUR","destination_id":"` + dest + `"}`, http.StatusUnprocessableEntity},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wantStatus(t, call(t, "POST", "/v1/payouts", key, uuid.NewString(), tc.body), tc.want)
@@ -281,18 +308,20 @@ func TestInputValidation(t *testing.T) {
 
 func TestIdempotencyKey(t *testing.T) {
 	_, key := newCustomer(t, "1000")
+	dest := newDestination(t, key)
+	body := payoutBody(dest, 100_00)
 
-	wantStatus(t, call(t, "POST", "/v1/payouts", key, "", payoutBody), http.StatusBadRequest)
+	wantStatus(t, call(t, "POST", "/v1/payouts", key, "", body), http.StatusBadRequest)
 
-	first := call(t, "POST", "/v1/payouts", key, "k1", payoutBody)
+	first := call(t, "POST", "/v1/payouts", key, "k1", body)
 	wantStatus(t, first, http.StatusCreated)
-	again := call(t, "POST", "/v1/payouts", key, "k1", payoutBody)
+	again := call(t, "POST", "/v1/payouts", key, "k1", body)
 	wantStatus(t, again, http.StatusCreated)
 	if !bytes.Equal(first.body, again.body) || again.header.Get("Idempotent-Replayed") != "true" {
 		t.Fatalf("replay differs or is not marked:\n%s\n%s", first.body, again.body)
 	}
 
-	other := map[string]any{"fiat_amount": 5_00, "fiat_currency": "USD", "destination": "bank_acct_1"}
+	other := payoutBody(dest, 5_00)
 	wantStatus(t, call(t, "POST", "/v1/payouts", key, "k1", other), http.StatusUnprocessableEntity)
 
 	// A request with this key is still running elsewhere.
@@ -314,6 +343,7 @@ func TestIdempotencyKey(t *testing.T) {
 // every success returns it.
 func TestConcurrentIdenticalCreates(t *testing.T) {
 	_, key := newCustomer(t, "")
+	body := payoutBody(newDestination(t, key), 100_00)
 	const n = 100
 	var (
 		wg    sync.WaitGroup
@@ -327,7 +357,7 @@ func TestConcurrentIdenticalCreates(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start // closing the channel releases every goroutine at once
-			r := call(t, "POST", "/v1/payouts", key, "same-key", payoutBody)
+			r := call(t, "POST", "/v1/payouts", key, "same-key", body)
 			mu.Lock()
 			defer mu.Unlock()
 			codes[r.status]++

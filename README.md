@@ -13,9 +13,17 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | M2 — Payout API + state machine | done |
 | M3 — Events (outbox relay, workers, resolver) | done |
 | M4 — Chains (EVM and Solana deposits) | done |
-| M5–M7 | planned |
+| M5 — Noah rail (destinations, signed adapter, standalone worker; webhooks next) | in progress |
+| M6–M7 | planned |
 
-What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Customers get their own EVM deposit address, derived from an xpub so Ferry never holds the key. `cmd/watcher` reads USDC transfers to those addresses, shows them as pending, and credits them after N confirmations. It handles reorgs by rewinding and orphaning, and re-checks every block hash before crediting. On Solana, each customer gets a token account at a seed-derived address. The watcher creates it on-chain (signing with a key that can create accounts but cannot move funds), reads only finalized slots, and credits a deposit as soon as it sees it. The treasury sweep out of deposit addresses comes later. The Noah sandbox (M5) is not wired in yet, so the rail is a mock that settles at once.
+What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Customers get their own EVM deposit address, derived from an xpub so Ferry never holds the key. `cmd/watcher` reads USDC transfers to those addresses, shows them as pending, and credits them after N confirmations. It handles reorgs by rewinding and orphaning, and re-checks every block hash before crediting. On Solana, each customer gets a token account at a seed-derived address. The watcher creates it on-chain (signing with a key that can create accounts but cannot move funds), reads only finalized slots, and credits a deposit as soon as it sees it. The treasury sweep out of deposit addresses comes later.
+
+Payouts go to saved bank accounts (`POST /v1/destinations`), which Ferry stores encrypted and shows only masked. With `FERRY_RAIL=noah`, Ferry is a client of the Noah Business API:
+- It picks the payout channel, prices the payout, and sells against its pre-funded USDC balance, signing every request (ES384).
+- `cmd/worker` runs as its own process.
+- A refusal releases the hold only when Noah definitely created nothing.
+
+There's no Noah sandbox key yet, so this runs against a fake Noah server built from the documented API (`make fake-noah`). `internal/rail/noah/sandbox_test.go` is ready for the real sandbox. The default rail is still the in-memory mock that settles at once.
 
 ## Run locally
 
@@ -34,7 +42,7 @@ The pinned tool versions are installed into `./bin` on first use.
 
 ### Try a payout
 
-Set `FERRY_ADMIN_KEY` in `.env` (for example `openssl rand -hex 32`) and keep `FERRY_ENV=dev`. Then:
+Set `FERRY_ADMIN_KEY` (for example `openssl rand -hex 32`) and `FERRY_DATA_KEY` (`openssl rand -base64 32`) in `.env`, and keep `FERRY_ENV=dev`. Then:
 
 ```bash
 make up && make migrate   # Postgres, ElasticMQ, a local Anvil chain and a Solana test validator
@@ -72,9 +80,18 @@ SOL_TO=...   # the solana-local address above
 docker compose exec -T solana spl-token -u http://localhost:8899 transfer $FERRY_SOLANA_USDC_MINT 200 $SOL_TO
 #    (Without a chain, POST $B/dev/deposits with the operator key still credits directly.)
 
-# 3. Ask for a 100.00 USD payout. The quote authorizes up to 101.50 USDC.
+# 3. Save the bank account to pay (a BankAch form, as Noah's channel asks for it). The
+#    response shows only "BankAch ****6789"; the details are stored encrypted.
+curl -s -X POST $B/destinations -H "Authorization: Bearer $KEY" -H "Idempotency-Key: dest-1" -d '{
+  "country":"US","fiat_currency":"USD","payment_method_type":"BankAch",
+  "form":{"AccountHolderAddress":{"Address":"1 Main St","City":"New York","State":"NY","PostalCode":"10001"},
+          "BankDetails":{"AccountNumber":"000123456789","BankCode":"021000021","AccountType":"Checking"},
+          "PaymentPurpose":"Invoice"}}'
+DID=...
+
+#    Ask for a 100.00 USD payout to it. The quote authorizes up to 101.50 USDC.
 curl -s -X POST $B/payouts -H "Authorization: Bearer $KEY" -H "Idempotency-Key: order-1" \
-  -d '{"fiat_amount":10000,"fiat_currency":"USD","destination":"bank_acct_1"}'
+  -d "{\"fiat_amount\":10000,\"fiat_currency\":\"USD\",\"destination_id\":\"$DID\"}"
 PID=...
 
 # 4. Confirm: holds 101.50 and returns "held". The worker then submits it to the mock rail,
@@ -89,6 +106,37 @@ curl -s $B/customers/$CID/balances -H "Authorization: Bearer $KEY"
 Sending step 3 again with the same `Idempotency-Key` returns the same payout with `Idempotent-Replayed: true`.
 
 If port 5432 is taken on your machine, set `POSTGRES_PORT` and the port in `DATABASE_URL` in `.env` to a free one.
+
+### Pay out through Noah (fake or sandbox)
+
+The same flow with the Noah adapter and separate processes. Without a sandbox key, use the fake:
+
+```bash
+make fake-noah            # fake Noah on 127.0.0.1:18090
+# in .env: FERRY_RAIL=noah, NOAH_BASE_URL=http://127.0.0.1:18090/v1, NOAH_API_KEY=fake-noah-key,
+#          FERRY_RESOLVER_STALE=5s; leave FERRY_ENV empty so the API runs no in-process worker
+make run                  # API: quotes through Noah
+make relay                # outbox -> queue
+make worker               # submits to Noah; the resolver polls Noah for status
+```
+
+Fund the customer as above (the dev deposit endpoint needs `FERRY_ENV=dev`; run the API once in dev mode for it), register a destination, create and confirm the payout. It reaches `submitted`. Then settle it at the fake:
+
+```bash
+curl -s localhost:18090/_control/transactions                # find the transaction ID
+curl -s -X POST localhost:18090/_control/transactions/<ID>/settle  # or fail, review
+```
+
+Within `FERRY_RESOLVER_STALE` the worker re-fetches it and the payout shows `settled`, with 199.50 available from a 300 deposit.
+
+With a sandbox key, point `NOAH_BASE_URL` at `https://api.sandbox.noah.com/v1` and set `NOAH_API_KEY` (and `NOAH_SIGNING_KEY_PATH` if your key requires signing). Then run the contract test first:
+
+```bash
+NOAH_API_KEY=... go test ./internal/rail/noah -run Sandbox -v          # channels + prepare
+NOAH_API_KEY=... NOAH_SANDBOX_SELL=1 go test ./internal/rail/noah -run Sandbox -v  # also a 1 USD sale
+```
+
+Noah webhooks (so payouts settle without polling) come in the next PR.
 
 ## License
 

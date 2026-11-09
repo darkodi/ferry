@@ -446,6 +446,45 @@ type Rail interface {
 
 The mock rail implements the same interface and can emit every row above (out-of-order events, long reviews, partial returns), so the core is tested without the sandbox.
 
+### What the Noah docs settled (M5)
+
+Read from docs.noah.com before writing the adapter (`internal/rail/noah`):
+
+- **A payout is four calls.** `GET /channels/sell` (read at runtime, never cached: channel ids and limits change), `POST /transactions/sell/prepare`, `POST /transactions/sell`, then `GET /transactions/{id}`.
+- **Prices have no expiry.** Prepare returns `CryptoAuthorizedAmount` and a `FormSessionID`, but no expiry. Its fixed-quote option cannot be passed to the sell call. Ferry therefore sets its own quote TTL (`NOAH_QUOTE_TTL`, default 2 minutes). The authorized amount already carries Noah's buffer for price moves; Ferry holds exactly that and sends it back unchanged.
+- **`EventVersion` is only on webhooks.** `GET /transactions/{id}` returns the current state with no version. The adapter ranks progress instead: Pending = 1, Settled or Failed = 2. The core moves money only when the rank increases; at an equal rank it records a new sub-status (a review moving on) and nothing else.
+- **Settled amounts come from `Breakdown`, which is in crypto.** `Remaining` is what paid the bank (Ferry's `Spent`); `ChannelFee` + `BusinessFee` is the `Fee`. They must add up to `Amount`. A missing or inconsistent breakdown fails closed: nothing is posted and the payout stays `submitted` for a human.
+- **A return is a new transaction.** Its `Reverses` points at the original, which stays `Settled`, and `GET /transactions` cannot filter by `ExternalID`. Finding returns is part of the webhook work (M5 PR 2).
+- **Payouts are first-party.** Ferry sells from its own balance under its own KYB, so sell calls omit `CustomerID`. Mapping each Ferry customer to a Noah customer (the Reliance model, `PUT /customers/{id}` with KYB data) is later work.
+
+**Destinations.** Noah prices a payout against a channel plus a bank-details form, or a saved `PaymentMethodID`. A customer therefore registers a bank account once (`POST /v1/destinations`: country, currency, payment method type such as `BankAch`, and the form), and a payout names it by `destination_id`.
+- The form is encrypted with AES-256-GCM under `FERRY_DATA_KEY`, with the row id as associated data. Only a masked summary ("BankAch ****6789") is stored in clear.
+- Only the API process holds the key; the worker never reads bank details.
+- After the first settled payout, Noah's `FiatPaymentMethod.ID` is stored on the destination, and later quotes send it instead of the form.
+- Ferry bounds the form's shape (size, depth, printable text) but does not re-implement Noah's JSON Schema. Noah validates the form at prepare, and a refusal fails the payout with Noah's reason.
+
+**Submit's error contract.** `rail.ErrRejected` makes the core release the hold, so the adapter returns it only when Noah definitely has no transaction for the payout:
+
+| Noah answers | Adapter returns | Core does |
+| --- | --- | --- |
+| 202 | the transaction | `held → submitted` |
+| 400, 402, 403 | first looks the payout up (`GET /transactions`, newest first, matching `ExternalID` and Direction `Out`): if found, the transaction; else `ErrRejected` | `submitted`; or `failed` with the hold released |
+| 401, 409, 429, 5xx, timeout | an unknown-outcome error | stays `held` with `needs_resolution`; the resolver resends with the same Nonce |
+
+The lookup matters because a 400 on its own is not proof: if an earlier attempt with this nonce went through and its answer was lost, a resend could be refused for another reason.
+
+**Request signing.** Every request carries `X-Api-Key` and, when a key is configured, an `Api-Signature` JWT. It is signed with ES384 and carries the claims `aud`, `iat`, `exp` (5 minutes), `method`, `path`, `queryParams` and `bodyHash` (the SHA-256 of the exact bytes sent). The signer uses only the standard library. A production base URL without a signing key is refused at startup, and the client never follows redirects.
+
+**Testing without a sandbox key.** `internal/rail/noah/noahtest` is a fake Noah server built from the documented payloads.
+- It checks the API key and every signature, and holds Ferry to prepare's authorized amount byte for byte.
+- It can inject 402, 400, 5xx and lost answers, and can settle, fail or review a transaction on command.
+- `make fake-noah` runs it locally.
+- `internal/rail/noah/sandbox_test.go` checks the fake's assumptions against the real sandbox when `NOAH_API_KEY` is set: what a resent Nonce returns, the authorized-amount format, the `queryParams` claim, and Breakdown on settlement.
+
+**Adding another rail.** The payout core sees only `rail.Rail`, so another off-ramp is a new package implementing `Prepare`, `Submit` and `Get` (plus its webhook check), chosen with `FERRY_RAIL`. Two things don't carry over:
+- Saved destinations hold a form in the rail's own shape (`destinations.rail`), so customers re-register bank accounts for a new rail.
+- The new rail must offer idempotent submits (a nonce or idempotency key), let Ferry tag a transaction with its own id, and quote a maximum or exact amount to hold.
+
 ## Reconciliation
 
 A scheduled job proves three sources agree and opens a `recon_break` for anything that does not; it never auto-corrects the ledger.
@@ -473,7 +512,10 @@ This table is the section an interviewer will probe; each row should have a test
 | Client retries `POST /payouts` | Two payouts | Idempotency key + request hash | 100 concurrent identical requests → 1 payout |
 | Two payouts race on one balance | Overdraft | Row lock on balance; check in same tx | Concurrent overspend → one succeeds |
 | Worker dies after rail call, before DB commit | Ledger says `held`; a naive retry sends again | Nonce persisted before the call; retry reuses it | Kill worker after rail call; restart; assert one rail tx |
-| Rail call times out | Unknown outcome | `needs_resolution`; resend with same Nonce, then fetch by `ExternalID` | Mock rail: timeout then success |
+| Rail call times out | Unknown outcome | `needs_resolution`; resend with same Nonce, then fetch by `ExternalID` | Mock rail: timeout then success; Noah fake: created then 500, resend → one Noah transaction |
+| Submit refused after an unknown outcome | Hold released while the money is moving | On 400/402/403 look the payout up by `ExternalID` before reporting a rejection | Noah fake: created then 400 → `submitted`, hold kept |
+| Rail settles with an unexplained amount | Wrong `settle` posting | `Breakdown` must add up to `Amount`, else nothing is applied | Noah fake: inconsistent breakdown → stays `submitted` |
+| Destination's bank details tampered with in the database | Payout to an attacker's account | AES-GCM with the row id as associated data; decryption fails closed | Ciphertext copied to another row → refused |
 | Duplicate webhook | Double settle | Inbox dedup; state check `submitted → settled` only | Send webhook 3× |
 | Out-of-order webhook | Old `Pending` overwrites `Settled` | Apply only if `EventVersion` is newer | Deliver Settled, then an older Pending |
 | Webhook never arrives | Payout stuck in `submitted` | Poller for payouts older than SLA with no review in progress; alert | Drop webhook; assert poller settles |
@@ -536,7 +578,9 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 | GET | `/v1/customers/{id}/balances` | Available and held per currency |
 | GET | `/v1/customers/{id}/deposit-addresses` | Per-chain addresses and their status |
 | GET | `/v1/customers/{id}/deposits` | Detected deposits: pending, confirmed or orphaned |
-| POST | `/v1/payouts` | Create + quote; requires `Idempotency-Key` |
+| POST | `/v1/destinations` | Save a bank account (rail form encrypted at rest); requires `Idempotency-Key`; returns only a masked display |
+| GET | `/v1/destinations` | The customer's saved bank accounts, masked |
+| POST | `/v1/payouts` | Create + quote to a `destination_id`; requires `Idempotency-Key` |
 | POST | `/v1/payouts/{id}/confirm` | Places hold, enqueues submit |
 | GET | `/v1/payouts/{id}` | State, quote, timeline of transitions |
 | GET | `/v1/ledger/entries?account_id=` | Paginated postings (cursor-based) |
@@ -574,7 +618,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 2. **M2 — Payout API + state machine.** Idempotency, holds, mock rail, failure paths.
 3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
 4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test. *(done; the treasury sweep is deferred, see Blockchain integration)*
-5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox.
+5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox. *(PR 1: destinations, signed adapter, standalone worker; PR 2: webhooks and returns)*
 6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard.
 7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video.
 

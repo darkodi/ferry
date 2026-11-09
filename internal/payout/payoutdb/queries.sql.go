@@ -13,7 +13,7 @@ import (
 )
 
 const getPayout = `-- name: GetPayout :one
-SELECT id, customer_id, idempotency_key, fiat_amount, fiat_currency, destination, status, needs_resolution, failure_reason, version, created_at, updated_at FROM payouts WHERE id = $1
+SELECT id, customer_id, idempotency_key, fiat_amount, fiat_currency, destination, status, needs_resolution, failure_reason, version, created_at, updated_at, destination_id FROM payouts WHERE id = $1
 `
 
 func (q *Queries) GetPayout(ctx context.Context, id uuid.UUID) (Payout, error) {
@@ -32,6 +32,7 @@ func (q *Queries) GetPayout(ctx context.Context, id uuid.UUID) (Payout, error) {
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DestinationID,
 	)
 	return i, err
 }
@@ -97,8 +98,8 @@ func (q *Queries) HeldMismatches(ctx context.Context) ([]HeldMismatchesRow, erro
 }
 
 const insertPayout = `-- name: InsertPayout :one
-INSERT INTO payouts (id, customer_id, idempotency_key, fiat_amount, fiat_currency, destination)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO payouts (id, customer_id, idempotency_key, fiat_amount, fiat_currency, destination, destination_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (customer_id, idempotency_key) DO NOTHING
 RETURNING id
 `
@@ -110,6 +111,7 @@ type InsertPayoutParams struct {
 	FiatAmount     int64
 	FiatCurrency   string
 	Destination    string
+	DestinationID  *uuid.UUID
 }
 
 // Returns no row when this customer already used the idempotency key.
@@ -121,6 +123,7 @@ func (q *Queries) InsertPayout(ctx context.Context, arg InsertPayoutParams) (uui
 		arg.FiatAmount,
 		arg.FiatCurrency,
 		arg.Destination,
+		arg.DestinationID,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)
@@ -372,6 +375,28 @@ func (q *Queries) Transition(ctx context.Context, arg TransitionParams) (int64, 
 		arg.FromStatus,
 		arg.Version,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateRailSubStatus = `-- name: UpdateRailSubStatus :execrows
+UPDATE rail_transactions
+SET sub_status = $1, updated_at = now()
+WHERE id = $2 AND last_event_version = $3 AND sub_status IS DISTINCT FROM $1
+`
+
+type UpdateRailSubStatusParams struct {
+	SubStatus    *string
+	ID           int64
+	EventVersion int64
+}
+
+// Records a new sub-status reported at the version already applied (a
+// review moving on while the status stays pending). Moves no money.
+func (q *Queries) UpdateRailSubStatus(ctx context.Context, arg UpdateRailSubStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateRailSubStatus, arg.SubStatus, arg.ID, arg.EventVersion)
 	if err != nil {
 		return 0, err
 	}
