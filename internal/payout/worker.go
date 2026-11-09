@@ -17,6 +17,9 @@ import (
 // SubmitConsumer is the worker's name in the inbox table.
 const SubmitConsumer = "payout-submit"
 
+// SyncConsumer is the inbox name for rail.sync handling.
+const SyncConsumer = "payout-sync"
+
 // Worker consumes payout events and submits held payouts to the rail.
 //
 // A delivery is acknowledged only after its work is done. If the worker
@@ -83,8 +86,14 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 // Handle does the work for one delivery. A nil error means it may be
 // acknowledged.
 func (w *Worker) Handle(ctx context.Context, d queue.Delivery) error {
-	if d.Topic != "payout."+string(Held) {
-		return nil // no work for other events yet
+	var consumer string
+	switch d.Topic {
+	case "payout." + string(Held):
+		consumer = SubmitConsumer
+	case SyncTopic:
+		consumer = SyncConsumer
+	default:
+		return nil // no work for other events
 	}
 	if d.ID == "" {
 		return errors.New("message has no id")
@@ -97,22 +106,32 @@ func (w *Worker) Handle(ctx context.Context, d queue.Delivery) error {
 		return fmt.Errorf("decode %s: no payout_id", d.Topic)
 	}
 
-	seen, err := inbox.Seen(ctx, w.svc.pool, SubmitConsumer, d.ID)
+	seen, err := inbox.Seen(ctx, w.svc.pool, consumer, d.ID)
 	if err != nil {
 		return err
 	}
 	if seen {
 		return nil
 	}
-	p, err := w.svc.Submit(ctx, ev.PayoutID)
-	if err != nil {
-		return fmt.Errorf("submit payout %s: %w", ev.PayoutID, err)
+	if consumer == SubmitConsumer {
+		p, err := w.svc.Submit(ctx, ev.PayoutID)
+		if err != nil {
+			return fmt.Errorf("submit payout %s: %w", ev.PayoutID, err)
+		}
+		// An unknown outcome is not an error here: the payout keeps
+		// NeedsResolution and the resolver retries it with the same nonce.
+		w.log.InfoContext(ctx, "payout submitted", "payout_id", p.ID, "status", p.Status,
+			"needs_resolution", p.NeedsResolution, "message_id", d.ID)
+	} else {
+		// A rail webhook said "look again": fetch from the rail and apply
+		// what it says now. Sync is idempotent, so a repeat changes nothing.
+		p, err := w.svc.Sync(ctx, ev.PayoutID)
+		if err != nil {
+			return fmt.Errorf("sync payout %s: %w", ev.PayoutID, err)
+		}
+		w.log.InfoContext(ctx, "payout synced", "payout_id", p.ID, "status", p.Status, "message_id", d.ID)
 	}
-	// An unknown outcome is not an error here: the payout keeps
-	// NeedsResolution and the resolver retries it with the same nonce.
-	w.log.InfoContext(ctx, "payout submitted", "payout_id", p.ID, "status", p.Status,
-		"needs_resolution", p.NeedsResolution, "message_id", d.ID)
-	if _, err := inbox.Record(ctx, w.svc.pool, SubmitConsumer, d.ID); err != nil {
+	if _, err := inbox.Record(ctx, w.svc.pool, consumer, d.ID); err != nil {
 		return err
 	}
 	return nil

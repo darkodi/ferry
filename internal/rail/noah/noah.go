@@ -324,7 +324,53 @@ func (r *Rail) Get(ctx context.Context, railTxID string) (rail.Tx, error) {
 	if out.Transaction.ID != railTxID {
 		return rail.Tx{}, fmt.Errorf("noah: asked for transaction %s, got %q", railTxID, out.Transaction.ID)
 	}
-	return r.toTx(out.Transaction)
+	tx, err := r.toTx(out.Transaction)
+	if err != nil || tx.Status != rail.StatusSettled {
+		return tx, err
+	}
+	ret, err := r.findReturn(ctx, out.Transaction)
+	if err != nil || ret == nil {
+		return tx, err
+	}
+	tx.Return, tx.Version = ret, versionReturned
+	return tx, nil
+}
+
+// findReturn looks for a bank return of a settled sale. Noah reports a
+// return as a new transaction whose Reverses is the original's id; the
+// original stays Settled and GET /transactions cannot filter by Reverses,
+// so this pages through transactions created since the original, oldest
+// first, at most LookbackPages pages. A match must be an incoming,
+// settled credit of the same currency.
+func (r *Rail) findReturn(ctx context.Context, orig Transaction) (*rail.Return, error) {
+	q := url.Values{}
+	q.Set("CreatedFrom", orig.Created.UTC().Format(time.RFC3339))
+	q.Set("SortDirection", "ASC")
+	q.Set("PageSize", "100")
+	for range r.cfg.LookbackPages {
+		var out txListResp
+		if err := r.c.do(ctx, http.MethodGet, "/transactions", q, nil, &out); err != nil {
+			return nil, err
+		}
+		for _, t := range out.Items {
+			if t.Reverses != orig.ID {
+				continue
+			}
+			if t.Direction != "In" || t.Status != "Settled" || t.CryptoCurrency != r.cfg.CryptoCurrency {
+				continue // not (yet) a completed return of this sale
+			}
+			amount, err := parseAmount(t.Amount)
+			if err != nil {
+				return nil, fmt.Errorf("noah: return %s of %s: %w", t.ID, orig.ID, err)
+			}
+			return &rail.Return{RailTxID: t.ID, Amount: amount}, nil
+		}
+		if out.PageToken == "" {
+			return nil, nil
+		}
+		q.Set("PageToken", out.PageToken)
+	}
+	return nil, nil
 }
 
 // Version ranks a transaction's progress. GET /transactions/{id} carries
@@ -334,6 +380,8 @@ func (r *Rail) Get(ctx context.Context, railTxID string) (rail.Tx, error) {
 const (
 	versionPending = 1
 	versionFinal   = 2 // Settled or Failed
+	// versionReturned: settled, and a bank return of it has settled too.
+	versionReturned = 3
 )
 
 // toTx maps a Noah transaction to the rail's view, checking what Ferry

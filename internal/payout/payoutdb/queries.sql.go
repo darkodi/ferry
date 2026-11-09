@@ -160,6 +160,39 @@ func (q *Queries) InsertQuote(ctx context.Context, arg InsertQuoteParams) error 
 	return err
 }
 
+const insertRailEvent = `-- name: InsertRailEvent :one
+INSERT INTO rail_events (rail, event_type, rail_tx_id, event_version, occurred, payload, payout_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (rail, rail_tx_id, event_version) DO NOTHING
+RETURNING id
+`
+
+type InsertRailEventParams struct {
+	Rail         string
+	EventType    string
+	RailTxID     string
+	EventVersion int64
+	Occurred     *time.Time
+	Payload      []byte
+	PayoutID     *uuid.UUID
+}
+
+// Returns no row for a redelivered event (same rail, transaction, version).
+func (q *Queries) InsertRailEvent(ctx context.Context, arg InsertRailEventParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertRailEvent,
+		arg.Rail,
+		arg.EventType,
+		arg.RailTxID,
+		arg.EventVersion,
+		arg.Occurred,
+		arg.Payload,
+		arg.PayoutID,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const insertRailTx = `-- name: InsertRailTx :one
 INSERT INTO rail_transactions (payout_id, attempt, nonce, external_id)
 VALUES ($1, $2, $3, $4)
@@ -242,6 +275,23 @@ func (q *Queries) MarkNeedsResolution(ctx context.Context, arg MarkNeedsResoluti
 	return result.RowsAffected(), nil
 }
 
+const maxRailEventVersion = `-- name: MaxRailEventVersion :one
+SELECT coalesce(max(event_version), 0)::bigint FROM rail_events
+WHERE rail = $1 AND rail_tx_id = $2
+`
+
+type MaxRailEventVersionParams struct {
+	Rail     string
+	RailTxID string
+}
+
+func (q *Queries) MaxRailEventVersion(ctx context.Context, arg MaxRailEventVersionParams) (int64, error) {
+	row := q.db.QueryRow(ctx, maxRailEventVersion, arg.Rail, arg.RailTxID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const payoutByKey = `-- name: PayoutByKey :one
 SELECT id FROM payouts WHERE customer_id = $1 AND idempotency_key = $2
 `
@@ -256,6 +306,26 @@ func (q *Queries) PayoutByKey(ctx context.Context, arg PayoutByKeyParams) (uuid.
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const payoutForRailTx = `-- name: PayoutForRailTx :one
+SELECT r.payout_id FROM rail_transactions r
+JOIN quotes q ON q.payout_id = r.payout_id
+WHERE r.rail_tx_id = $1 AND q.rail = $2
+LIMIT 1
+`
+
+type PayoutForRailTxParams struct {
+	RailTxID *string
+	Rail     string
+}
+
+// The payout a rail transaction belongs to, for the named rail.
+func (q *Queries) PayoutForRailTx(ctx context.Context, arg PayoutForRailTxParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, payoutForRailTx, arg.RailTxID, arg.Rail)
+	var payout_id uuid.UUID
+	err := row.Scan(&payout_id)
+	return payout_id, err
 }
 
 const setRailTxStatus = `-- name: SetRailTxStatus :exec

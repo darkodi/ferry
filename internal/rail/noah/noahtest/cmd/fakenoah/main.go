@@ -5,6 +5,10 @@
 //	FAKE_NOAH_API_KEY         the API key it accepts (default fake-noah-key)
 //	FAKE_NOAH_SIGNING_PUBKEY  optional PEM public key; if set, every request
 //	                          must carry a valid Api-Signature
+//	FAKE_NOAH_WEBHOOK_URL     optional; where to POST signed Transaction webhooks,
+//	                          e.g. http://127.0.0.1:8080/v1/webhooks/noah
+//	FAKE_NOAH_WEBHOOK_KEY     PEM P-384 private key that signs them; give Ferry the
+//	                          public half as NOAH_WEBHOOK_PUBLIC_KEY
 //
 // Point Ferry at it with NOAH_BASE_URL=http://127.0.0.1:18090/v1. Drive
 // transactions with:
@@ -24,6 +28,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/darkodi/ferry/internal/rail/noah"
 	"github.com/darkodi/ferry/internal/rail/noah/noahtest"
 )
 
@@ -45,6 +50,18 @@ func run(log *slog.Logger) error {
 		}
 	}
 	s := noahtest.NewUnstarted(envOr("FAKE_NOAH_API_KEY", "fake-noah-key"), pub, time.Now)
+	if url := os.Getenv("FAKE_NOAH_WEBHOOK_URL"); url != "" {
+		b, err := os.ReadFile(os.Getenv("FAKE_NOAH_WEBHOOK_KEY")) //nolint:gosec // an operator-chosen key file for a local dev tool
+		if err != nil {
+			return fmt.Errorf("FAKE_NOAH_WEBHOOK_KEY: %w", err)
+		}
+		key, err := noah.ParseSigningKey(b) // same PEM forms as a request-signing key
+		if err != nil {
+			return err
+		}
+		s.EnableWebhooks(url, key, true)
+		log.Info("fake Noah sends webhooks", "url", url)
+	}
 	log.Info("fake Noah listening", "base_url", "http://"+addr+"/v1", "signing_required", pub != nil)
 	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	if err := srv.ListenAndServe(); err != nil {

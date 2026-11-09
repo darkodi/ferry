@@ -104,10 +104,30 @@ type Return struct {
 	Amount   ledger.Amount
 }
 
+// Event is a verified webhook from the rail. It only says "look again":
+// Ferry stores it and re-fetches the transaction before moving money.
+type Event struct {
+	Rail     string // e.g. "noah"
+	Type     string // the rail's event type, e.g. "Transaction"
+	RailTxID string // the transaction the event is about
+	// Reverses is set when this transaction reverses (returns) an earlier
+	// one; the payout is found through that earlier transaction.
+	Reverses string
+	Version  int64 // increases with every change of the transaction
+	Occurred time.Time
+	Payload  []byte // the verified body, kept for audit
+}
+
 // Errors.
 var (
 	// ErrRejected: the rail refused the request and created nothing.
 	ErrRejected = errors.New("rail: rejected")
 	// ErrNotFound: the rail has no such transaction.
 	ErrNotFound = errors.New("rail: not found")
+	// ErrBadSignature: a webhook was not signed by the rail. Store
+	// nothing and answer 401.
+	ErrBadSignature = errors.New("rail: webhook signature does not verify")
+	// ErrIgnoredEvent: a verified webhook Ferry has no use for. Answer
+	// 2xx so the rail stops retrying.
+	ErrIgnoredEvent = errors.New("rail: webhook event not used")
 )

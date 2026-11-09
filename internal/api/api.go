@@ -26,6 +26,7 @@ import (
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
+	"github.com/darkodi/ferry/internal/rail"
 )
 
 // Config wires the API to its dependencies.
@@ -44,12 +45,22 @@ type Config struct {
 	AdminKey string
 	// Dev enables /v1/dev routes that move money without a real deposit.
 	Dev bool
-	Log *slog.Logger
+	// RailWebhooks verifies the payout rail's webhooks; nil serves no
+	// webhook route (the mock rail sends none).
+	RailWebhooks RailWebhooks
+	Log          *slog.Logger
 }
 
 type server struct {
 	Config
 	adminHash [32]byte
+}
+
+// RailWebhooks verifies and parses one rail's webhooks
+// (noah.Webhooks).
+type RailWebhooks interface {
+	Name() string
+	Parse(body []byte, header http.Header) (rail.Event, error)
 }
 
 // New returns the API's HTTP handler.
@@ -60,6 +71,11 @@ func New(cfg Config) http.Handler {
 	r.Use(middleware.RequestID, s.logRequests, middleware.Recoverer)
 
 	r.Route("/v1", func(r chi.Router) {
+		// The rail's webhooks: no customer or admin key, the body's
+		// signature is the authentication.
+		if cfg.RailWebhooks != nil {
+			r.Post("/webhooks/{rail}", s.railWebhook)
+		}
 		r.Group(func(r chi.Router) { // operator
 			r.Use(s.requireAdmin)
 			r.Post("/customers", s.createCustomer)

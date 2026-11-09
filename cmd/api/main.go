@@ -7,7 +7,9 @@
 //	FERRY_ENV            "dev" enables /v1/dev routes and runs the relay, worker
 //	                     and resolver in-process (with the mock rail, it also settles at once)
 //	FERRY_ADDR           listen address (default 127.0.0.1:8080)
-//	FERRY_RAIL           "mock" (default) or "noah"; see internal/rail/noah.FromEnv for NOAH_*
+//	FERRY_RAIL           "mock" (default) or "noah"; see internal/rail/noah.FromEnv for NOAH_*.
+//	                     With noah, POST /v1/webhooks/noah verifies Noah's webhooks with Noah's
+//	                     published key, or NOAH_WEBHOOK_PUBLIC_KEY (a PEM file) if set
 //	FERRY_DATA_KEY       base64 32-byte key that encrypts saved bank details (required)
 //	FERRY_SQS_QUEUE_URL  dev mode: payout queue (ElasticMQ); empty uses an in-memory queue
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. http://localhost:9324
@@ -115,6 +117,13 @@ func run(log *slog.Logger) error {
 		log.Info("payouts are submitted by cmd/worker", "rail", rl.Name())
 	}
 
+	var hooks api.RailWebhooks
+	if rl.Name() == "noah" {
+		if hooks, err = noah.WebhooksFromEnv(os.Getenv); err != nil {
+			return err
+		}
+	}
+
 	addresses, err := depositAddresses(ctx, pool, log)
 	if err != nil {
 		return err
@@ -129,6 +138,7 @@ func run(log *slog.Logger) error {
 		Addresses:    addresses,
 		AdminKey:     adminKey,
 		Dev:          dev,
+		RailWebhooks: hooks,
 		Log:          log,
 	})
 	srv := &http.Server{
