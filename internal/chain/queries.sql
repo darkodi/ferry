@@ -10,8 +10,22 @@ VALUES (@customer_id, @chain, @address, @derivation_index, @status);
 -- name: CustomerAddresses :many
 SELECT * FROM deposit_addresses WHERE customer_id = @customer_id ORDER BY chain;
 
--- name: ActiveAddresses :many
-SELECT address, customer_id FROM deposit_addresses WHERE chain = @chain AND status = 'active';
+-- name: WatchedAddresses :many
+-- Provisioning addresses are watched too: if the watcher stops after
+-- creating an account but before marking it active, a deposit that lands
+-- in between is still found.
+SELECT address, customer_id FROM deposit_addresses
+WHERE chain = @chain AND status IN ('active', 'provisioning');
+
+-- name: ProvisioningAddresses :many
+SELECT address, derivation_index FROM deposit_addresses
+WHERE chain = @chain AND status = 'provisioning'
+ORDER BY derivation_index
+LIMIT @max_rows;
+
+-- name: ActivateAddress :execrows
+UPDATE deposit_addresses SET status = 'active', updated_at = now()
+WHERE chain = @chain AND address = @address AND status = 'provisioning';
 
 -- name: CustomersWithoutAddress :many
 -- Customers created before a chain was configured.

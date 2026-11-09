@@ -35,5 +35,26 @@ services:
     ports:
       - "127.0.0.1:${ANVIL_PORT:-8545}:8545"
 
+  # Local Solana validator for deposits. State is in memory (--reset):
+  # restarting it resets the chain (run `make chain-setup` again). Dev
+  # keypairs live in ./.dev/solana (git-ignored) so addresses survive that.
+  # Agave 3 needs io_uring, which Docker's default seccomp profile blocks,
+  # hence seccomp=unconfined; the RPC port is bound to loopback only.
+  solana:
+    image: anzaxyz/agave:v3.1.14
+    entrypoint: ["solana-test-validator"]
+    command: ["--ledger", "/tmp/ledger", "--reset", "--quiet"]
+    security_opt:
+      - seccomp=unconfined
+    ports:
+      - "127.0.0.1:${SOLANA_RPC_PORT:-8899}:8899"
+    volumes:
+      - ./.dev/solana:/ferry
+    healthcheck:
+      test: ["CMD", "solana", "-u", "http://localhost:8899", "cluster-version"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
 volumes:
   pgdata:

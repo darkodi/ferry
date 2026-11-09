@@ -26,12 +26,13 @@ SQLC_VERSION          := v1.31.1
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: help up down migrate migrate-status run relay watcher contracts chain-setup test lint vet vuln gitleaks sqlc tools
+.PHONY: help up down migrate migrate-status run relay watcher watcher-solana contracts chain-setup evm-setup solana-setup test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
 
-up: ## Start local infra (Postgres) and wait until healthy
+up: ## Start local infra (Postgres, queue, local chains) and wait until healthy
+	@mkdir -p .dev/solana  # before Docker would create it as root for the bind mount
 	docker compose up -d --wait
 
 down: ## Stop local infra and delete its volumes
@@ -52,6 +53,9 @@ relay: ## Run the outbox relay (needs `make up` for the queue)
 watcher: ## Run the EVM deposit watcher (needs `make up` and `make chain-setup`)
 	DATABASE_URL="$(DATABASE_URL)" FERRY_CHAIN=evm go run ./cmd/watcher
 
+watcher-solana: ## Run the Solana deposit watcher (needs `make up` and `make chain-setup`)
+	DATABASE_URL="$(DATABASE_URL)" FERRY_CHAIN=solana go run ./cmd/watcher
+
 # Anvil's first default account. Anvil keeps its keys unlocked, so no
 # private key is needed (or stored) to deploy or send from it.
 ANVIL_ACCOUNT := 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
@@ -62,11 +66,39 @@ contracts: ## Recompile contracts/ with the pinned solc image
 	docker run --rm -v "$(CURDIR)/contracts:/src" -u "$$(id -u):$$(id -g)" $(SOLC_IMAGE) \
 		--optimize --bin --abi --overwrite -o /src/build /src/TestUSDC.sol
 
-chain-setup: ## Deploy TestUSDC to local Anvil and mint 1,000,000 to the first account
+chain-setup: evm-setup solana-setup ## Set up both local chains (test USDC on Anvil and on the Solana validator)
+
+evm-setup: ## Deploy TestUSDC to local Anvil and mint 1,000,000 to the first account
 	@addr=$$($(ANVIL_CAST) --json --create $$(cat contracts/build/TestUSDC.bin) \
 		| tr ',' '\n' | grep '"contractAddress"' | cut -d'"' -f4); \
 	$(ANVIL_CAST) $$addr "mint(address,uint256)" $(ANVIL_ACCOUNT) 1000000000000 >/dev/null; \
 	echo "TestUSDC deployed at $$addr (FERRY_EVM_USDC_ADDRESS)"
+
+# Runs inside the validator container, which has the solana and spl-token
+# CLIs. Keypairs are created once in .dev/solana (git-ignored) and reused,
+# so the mint and authority addresses stay the same across chain resets.
+#   authority.json  Ferry's authority (FERRY_SOLANA_AUTHORITY_KEYPAIR), 10 SOL for rent and fees
+#   owner.json      the deposit owner: token owner of every deposit account. Ferry gets only its
+#                   public key (FERRY_SOLANA_DEPOSIT_OWNER); the private key is for the future sweep
+#   wallet.json     a dev sender: mint authority, holds 1,000,000 test USDC
+#   usdc-mint.json  the test USDC mint (6 decimals)
+SOLANA_EXEC := docker compose exec -T solana
+solana-setup: ## Create the test USDC mint on the local Solana validator and fund the dev keys
+	@mkdir -p .dev/solana
+	@$(SOLANA_EXEC) sh -ec '\
+		cd /ferry; \
+		for k in authority owner wallet usdc-mint; do [ -f $$k.json ] || solana-keygen new --no-bip39-passphrase --silent -o $$k.json >/dev/null; done; \
+		chmod 600 *.json; chown $(shell id -u):$(shell id -g) . *.json; \
+		solana config set -u http://localhost:8899 -k /ferry/wallet.json >/dev/null; \
+		solana airdrop 100 >/dev/null; \
+		solana airdrop 10 authority.json >/dev/null; \
+		spl-token create-token --decimals 6 usdc-mint.json >/dev/null; \
+		mint=$$(solana-keygen pubkey usdc-mint.json); \
+		spl-token create-account $$mint >/dev/null; \
+		spl-token mint $$mint 1000000 >/dev/null; \
+		echo "Solana test USDC mint $$mint (FERRY_SOLANA_USDC_MINT)"; \
+		echo "Solana authority $$(solana-keygen pubkey authority.json) (FERRY_SOLANA_AUTHORITY)"; \
+		echo "Solana deposit owner $$(solana-keygen pubkey owner.json) (FERRY_SOLANA_DEPOSIT_OWNER)"'
 
 test: ## Unit + integration tests with the race detector
 	go test -race -count=1 ./...

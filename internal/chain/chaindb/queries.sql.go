@@ -11,33 +11,22 @@ import (
 	"github.com/google/uuid"
 )
 
-const activeAddresses = `-- name: ActiveAddresses :many
-SELECT address, customer_id FROM deposit_addresses WHERE chain = $1 AND status = 'active'
+const activateAddress = `-- name: ActivateAddress :execrows
+UPDATE deposit_addresses SET status = 'active', updated_at = now()
+WHERE chain = $1 AND address = $2 AND status = 'provisioning'
 `
 
-type ActiveAddressesRow struct {
-	Address    string
-	CustomerID uuid.UUID
+type ActivateAddressParams struct {
+	Chain   string
+	Address string
 }
 
-func (q *Queries) ActiveAddresses(ctx context.Context, chain string) ([]ActiveAddressesRow, error) {
-	rows, err := q.db.Query(ctx, activeAddresses, chain)
+func (q *Queries) ActivateAddress(ctx context.Context, arg ActivateAddressParams) (int64, error) {
+	result, err := q.db.Exec(ctx, activateAddress, arg.Chain, arg.Address)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rows.Close()
-	var items []ActiveAddressesRow
-	for rows.Next() {
-		var i ActiveAddressesRow
-		if err := rows.Scan(&i.Address, &i.CustomerID); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+	return result.RowsAffected(), nil
 }
 
 const confirmDeposit = `-- name: ConfirmDeposit :execrows
@@ -324,6 +313,43 @@ func (q *Queries) OrphanDeposit(ctx context.Context, id uuid.UUID) (int64, error
 	return result.RowsAffected(), nil
 }
 
+const provisioningAddresses = `-- name: ProvisioningAddresses :many
+SELECT address, derivation_index FROM deposit_addresses
+WHERE chain = $1 AND status = 'provisioning'
+ORDER BY derivation_index
+LIMIT $2
+`
+
+type ProvisioningAddressesParams struct {
+	Chain   string
+	MaxRows int32
+}
+
+type ProvisioningAddressesRow struct {
+	Address         string
+	DerivationIndex int64
+}
+
+func (q *Queries) ProvisioningAddresses(ctx context.Context, arg ProvisioningAddressesParams) ([]ProvisioningAddressesRow, error) {
+	rows, err := q.db.Query(ctx, provisioningAddresses, arg.Chain, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ProvisioningAddressesRow
+	for rows.Next() {
+		var i ProvisioningAddressesRow
+		if err := rows.Scan(&i.Address, &i.DerivationIndex); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const pruneBlocks = `-- name: PruneBlocks :exec
 DELETE FROM chain_blocks WHERE chain = $1 AND number < $2
 `
@@ -496,4 +522,37 @@ func (q *Queries) UpsertDeposit(ctx context.Context, arg UpsertDepositParams) (u
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const watchedAddresses = `-- name: WatchedAddresses :many
+SELECT address, customer_id FROM deposit_addresses
+WHERE chain = $1 AND status IN ('active', 'provisioning')
+`
+
+type WatchedAddressesRow struct {
+	Address    string
+	CustomerID uuid.UUID
+}
+
+// Provisioning addresses are watched too: if the watcher stops after
+// creating an account but before marking it active, a deposit that lands
+// in between is still found.
+func (q *Queries) WatchedAddresses(ctx context.Context, chain string) ([]WatchedAddressesRow, error) {
+	rows, err := q.db.Query(ctx, watchedAddresses, chain)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []WatchedAddressesRow
+	for rows.Next() {
+		var i WatchedAddressesRow
+		if err := rows.Scan(&i.Address, &i.CustomerID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
