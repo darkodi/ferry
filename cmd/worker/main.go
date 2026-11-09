@@ -6,12 +6,16 @@
 //	DATABASE_URL         Postgres connection string (required)
 //	FERRY_SQS_QUEUE_URL  queue to read from (required)
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. ElasticMQ locally
-//	FERRY_RAIL           which rail to submit to; "noah" arrives in M5
+//	FERRY_RAIL           which rail to submit to: "noah" (see internal/rail/noah.FromEnv for NOAH_*)
+//	FERRY_RESOLVER_STALE how long a payout may sit held or submitted before the
+//	                     resolver re-drives it (default 1m); without a public webhook
+//	                     URL this is how often Noah is polled
 //
-// Until M5 the only rail is the in-memory mock, which cannot be shared
-// with the API process that made the quotes. The worker therefore refuses
-// to start; in dev, cmd/api with FERRY_ENV=dev runs the same worker
-// in-process instead.
+// The mock rail lives in one process's memory and cannot be shared with
+// the API process that made the quotes, so it is refused here; in dev,
+// cmd/api with FERRY_ENV=dev runs the same worker in-process instead.
+//
+// The worker never reads bank details, so it does not get FERRY_DATA_KEY.
 package main
 
 import (
@@ -27,10 +31,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
 	"github.com/darkodi/ferry/internal/platform/queue"
 	"github.com/darkodi/ferry/internal/rail"
+	"github.com/darkodi/ferry/internal/rail/noah"
 )
 
 func main() {
@@ -69,25 +75,37 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	svc := payout.NewService(pool, rl, house, time.Now)
+	dests, err := destination.NewStore(pool, rl.Name(), nil)
+	if err != nil {
+		return err
+	}
+	svc := payout.NewService(pool, rl, dests, house, time.Now)
+	resolver := payout.NewResolver(svc, log)
+	if v := os.Getenv("FERRY_RESOLVER_STALE"); v != "" {
+		if resolver.StaleAfter, err = time.ParseDuration(v); err != nil || resolver.StaleAfter <= 0 {
+			return fmt.Errorf("FERRY_RESOLVER_STALE %q: want a positive duration such as 1m", v)
+		}
+	}
 	var wg sync.WaitGroup
 	wg.Go(func() { payout.NewWorker(svc, q, log).Run(ctx) })
-	wg.Go(func() { payout.NewResolver(svc, log).Run(ctx, 15*time.Second) })
-	log.Info("worker started", "rail", rl.Name())
+	// Look as often as the staleness threshold, at most every 15 seconds.
+	every := min(15*time.Second, resolver.StaleAfter)
+	wg.Go(func() { resolver.Run(ctx, every) })
+	log.Info("worker started", "rail", rl.Name(), "resolver_stale", resolver.StaleAfter.String())
 	wg.Wait()
 	log.Info("worker stopped")
 	return nil
 }
 
-// railFromEnv picks the rail adapter. The Noah adapter is added in M5;
-// until then every choice is an error.
-//
-//nolint:unparam // the Rail result is always nil until M5 adds a shareable adapter
+// railFromEnv picks the rail adapter. Only a rail reachable from several
+// processes can serve a separate worker.
 func railFromEnv(name string) (rail.Rail, error) {
 	switch name {
+	case "noah":
+		return noah.FromEnv(os.Getenv, time.Now)
 	case "", "mock":
 		return nil, errors.New("the mock rail lives in one process's memory and cannot serve a separate worker; " +
-			"run cmd/api with FERRY_ENV=dev, which runs the worker in-process, until the Noah rail (M5)")
+			"set FERRY_RAIL=noah, or run cmd/api with FERRY_ENV=dev, which runs the worker in-process")
 	default:
 		return nil, fmt.Errorf("unknown FERRY_RAIL %q", name)
 	}

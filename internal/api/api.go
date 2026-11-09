@@ -22,6 +22,7 @@ import (
 
 	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/customer"
+	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
@@ -31,8 +32,10 @@ import (
 type Config struct {
 	Pool    *pgxpool.Pool
 	Payouts *payout.Service
-	Idem    *idempotency.Store
-	House   ledger.HouseAccounts
+	// Destinations stores customers' bank accounts (needs the data key).
+	Destinations *destination.Store
+	Idem         *idempotency.Store
+	House        ledger.HouseAccounts
 	// Addresses assigns deposit addresses to new customers. Nil assigns
 	// none (no chain configured).
 	Addresses *chain.Addresses
@@ -70,8 +73,10 @@ func New(cfg Config) http.Handler {
 			r.Get("/customers/{id}/deposit-addresses", s.depositAddresses)
 			r.Get("/customers/{id}/deposits", s.deposits)
 			r.Get("/payouts/{id}", s.getPayout)
+			r.Get("/destinations", s.listDestinations)
 			r.Group(func(r chi.Router) {
 				r.Use(cfg.Idem.Middleware(customerOf, writeError))
+				r.Post("/destinations", s.createDestination)
 				r.Post("/payouts", s.createPayout)
 				r.Post("/payouts/{id}/confirm", s.confirmPayout)
 			})

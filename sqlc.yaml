@@ -79,3 +79,12 @@ sql:
         out: internal/chain/chaindb
         sql_package: pgx/v5
         overrides: *overrides
+  - engine: postgresql
+    schema: migrations
+    queries: internal/destination/queries.sql
+    gen:
+      go:
+        package: destinationdb
+        out: internal/destination/destinationdb
+        sql_package: pgx/v5
+        overrides: *overrides

@@ -73,6 +73,22 @@ type DepositAddress struct {
 	UpdatedAt       time.Time
 }
 
+type Destination struct {
+	ID                  uuid.UUID
+	CustomerID          uuid.UUID
+	Rail                string
+	Country             string
+	FiatCurrency        string
+	PaymentMethodType   string
+	Display             string
+	FormCiphertext      []byte
+	KeyID               string
+	RailPaymentMethodID *string
+	Status              string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
 type IdempotencyKey struct {
 	CustomerID     uuid.UUID
 	Key            string
@@ -122,6 +138,7 @@ type Payout struct {
 	Version         int32
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+	DestinationID   *uuid.UUID
 }
 
 type Posting struct {

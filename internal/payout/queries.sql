@@ -1,7 +1,7 @@
 -- name: InsertPayout :one
 -- Returns no row when this customer already used the idempotency key.
-INSERT INTO payouts (id, customer_id, idempotency_key, fiat_amount, fiat_currency, destination)
-VALUES (@id, @customer_id, @idempotency_key, @fiat_amount, @fiat_currency, @destination)
+INSERT INTO payouts (id, customer_id, idempotency_key, fiat_amount, fiat_currency, destination, destination_id)
+VALUES (@id, @customer_id, @idempotency_key, @fiat_amount, @fiat_currency, @destination, @destination_id)
 ON CONFLICT (customer_id, idempotency_key) DO NOTHING
 RETURNING id;
 
@@ -54,6 +54,13 @@ UPDATE rail_transactions
 SET rail_tx_id = @rail_tx_id, status = @status, sub_status = @sub_status,
     last_event_version = @event_version, updated_at = now()
 WHERE id = @id AND last_event_version < @event_version;
+
+-- name: UpdateRailSubStatus :execrows
+-- Records a new sub-status reported at the version already applied (a
+-- review moving on while the status stays pending). Moves no money.
+UPDATE rail_transactions
+SET sub_status = @sub_status, updated_at = now()
+WHERE id = @id AND last_event_version = @event_version AND sub_status IS DISTINCT FROM @sub_status;
 
 -- name: HeldMismatches :many
 -- Customers whose held balance differs from the authorized amounts of

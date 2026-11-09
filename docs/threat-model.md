@@ -12,6 +12,7 @@ STRIDE analysis per component and trust boundary. Each component adds its sectio
 | TB4 | Ferry binaries ↔ queue | SQS messages (ElasticMQ locally) carrying outbox events | M3 |
 | TB5 | Chain RPC node → watcher | JSON-RPC responses: headers, block hashes, logs (EVM); slots, signatures, transactions with token balances (Solana) | M4 |
 | TB6 | Solana watcher → Solana cluster | Account-creation transactions signed with the authority key | M4 |
+| TB7 | Ferry → Noah Business API | HTTPS requests with the API key and an ES384 request signature; customer bank details in prepare bodies | M5 |
 
 Later milestones add the public API, inbound rail webhooks, chain RPC and the queue.
 
@@ -230,3 +231,45 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 - **One RPC call per deposit account per round.** `getSignaturesForAddress` pages back from the newest finalized signature each round. That is fine at portfolio scale; at volume, remember the last signature per account (`until`) or use a webhook or indexer.
 - **The validator container runs without seccomp.** Agave 3 needs `io_uring`, which Docker's default seccomp profile blocks. This applies only to the local and test validator, which binds to loopback; a custom profile that allows just `io_uring_*` would be tighter.
 - **Dust deposits are credited**, as on EVM.
+
+## Noah rail adapter and destinations (M5)
+
+`internal/rail/noah` talks to Noah over TB7; `internal/destination` stores the bank accounts payouts go to. Webhooks (inbound) are the next PR.
+
+**Assets:**
+- the Noah API key and request-signing key (together they can spend Ferry's pre-funded balance);
+- customers' bank details (personal data);
+- the data key that encrypts them;
+- the payout hold, which must not be released while money is moving.
+
+**Assumptions:**
+- Noah is a trusted counterparty but can time out, repeat itself or answer inconsistently.
+- The network path to Noah is TLS; anything that can read process memory or environment can read the keys.
+- Database backups and read access are wider than application access.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: forged request to Noah | Someone with the API key alone moves money | Requests are signed (ES384 JWT bound to method, path, query and body hash, 5-minute life); production refuses to start without a signing key | `TestSignClaims`, `TestUnsignedRequestsRefused`, `TestClientConfig` |
+| **T**ampering: request altered in transit | Body or query changed after signing | The signature covers a hash of the exact body bytes and the query; Noah (and the fake) reject a mismatch | `TestSignClaims` |
+| **T**ampering: redirect | A redirect resends the API key and signed body elsewhere | The client never follows redirects | `TestNoRedirects` |
+| **T**ampering: release while money moves | A refusal answer after a lost success releases the hold | 4xx is a rejection only after a lookup by `ExternalID` finds nothing; other errors keep the hold and resend the same Nonce | `TestNoahRefusedButCreatedIsNotReleased`, `TestNoahLostAnswerResentWithSameNonce` |
+| **T**ampering: wrong settlement amount | Noah reports Settled with amounts that do not add up | `Breakdown` must sum to `Amount` and parse exactly; otherwise nothing is posted | `TestSettledBreakdownMustAddUp`, `TestNoahUnexplainedSettlementNotApplied` |
+| **T**ampering: bank details swapped in the database | An attacker with DB write access points a destination at their account | AES-GCM authenticates each ciphertext with its row id as associated data; a moved or edited ciphertext does not decrypt, and quoting fails closed | `TestTamperedOrWrongKeyRefused` |
+| **T**ampering: lax amounts | Noah sends `.5`, `+5` or 7 decimals | Strict parser: refused, never rounded | `TestAmounts`, `FuzzParseNoahAmount` |
+| **R**epudiation | "Ferry sent a different amount" | Each sell carries prepare's authorized amount unchanged, a stored Nonce and `ExternalID = payout_id`; Noah's error `Instance` is kept in the error | — |
+| **I**nformation disclosure: bank details at rest | A database dump or backup leaks account numbers | Encrypted with `FERRY_DATA_KEY`; only "BankAch ****6789" in clear; the idempotency store keeps only the masked response | `TestFormEncryptedAtRest` |
+| **I**nformation disclosure: bank details in logs | Request bodies or errors logged | The Noah client never logs; the API never echoes the form; the manual run checked every log for the account number | manual e2e (README) |
+| **I**nformation disclosure: another customer's destination | Probe ids to read or pay to someone's account | Every read and quote is scoped to the caller; a foreign id is "not found" | `TestOwnershipAndCheck`, API `TestInputValidation` |
+| **E**levation of privilege: worker reads bank details | A compromised worker leaks the forms | The worker never gets `FERRY_DATA_KEY`; its store can check and remember payment methods only | `TestNoKeyStore` |
+| **E**levation of privilege: app edits destinations | Change a destination's bank details | `ferry_app` may update only `rail_payment_method_id`, `status` and `updated_at`; new details mean a new destination | — (grants in `00009_destinations.sql`) |
+
+### Residual risks
+
+- **Keys are environment variables and files.** `NOAH_API_KEY`, the signing key file and `FERRY_DATA_KEY` sit in the process environment or on disk until KMS (M7). Anyone who can read them can spend the Noah balance or decrypt bank details.
+- **One data key, no rotation yet.** `key_id` records which key encrypted each row, so rotation is possible, but there is no re-encryption job.
+- **Sandbox behaviour is assumed, not observed.** Until a sandbox key exists, these come from the docs, encoded in the fake: what a resent Nonce returns, the authorized-amount format, `queryParams` typing in the signature, and Breakdown on settlement. `sandbox_test.go` checks them.
+- **The lookup by `ExternalID` is bounded** to the last 7 days and 10 pages of 100 transactions. If the page limit is reached first, the outcome is reported as unknown and the hold is kept. A sale older than 7 days would not be found. That is unrealistic, because the resolver resends within minutes of an unclear answer.
+- **The masked display can reveal the last four digits.** That is standard practice, but it is still personal data in the API response.
+

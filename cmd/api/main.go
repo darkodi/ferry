@@ -4,9 +4,11 @@
 //
 //	DATABASE_URL         Postgres connection string (required)
 //	FERRY_ADMIN_KEY      operator key for admin routes, at least 32 characters (required)
-//	FERRY_ENV            "dev" enables /v1/dev routes, an auto-settling mock
-//	                     rail, and runs the relay, worker and resolver in-process
+//	FERRY_ENV            "dev" enables /v1/dev routes and runs the relay, worker
+//	                     and resolver in-process (with the mock rail, it also settles at once)
 //	FERRY_ADDR           listen address (default 127.0.0.1:8080)
+//	FERRY_RAIL           "mock" (default) or "noah"; see internal/rail/noah.FromEnv for NOAH_*
+//	FERRY_DATA_KEY       base64 32-byte key that encrypts saved bank details (required)
 //	FERRY_SQS_QUEUE_URL  dev mode: payout queue (ElasticMQ); empty uses an in-memory queue
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. http://localhost:9324
 //	FERRY_EVM_CHAIN      EVM chain name in the database (default evm-local)
@@ -34,12 +36,15 @@ import (
 	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/chain/evm"
 	"github.com/darkodi/ferry/internal/chain/solana"
+	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
 	"github.com/darkodi/ferry/internal/payout"
 	"github.com/darkodi/ferry/internal/platform/queue"
+	"github.com/darkodi/ferry/internal/rail"
 	"github.com/darkodi/ferry/internal/rail/mock"
+	"github.com/darkodi/ferry/internal/rail/noah"
 )
 
 func main() {
@@ -64,6 +69,10 @@ func run(log *slog.Logger) error {
 	if len(adminKey) < 32 {
 		return errors.New("FERRY_ADMIN_KEY must be at least 32 characters")
 	}
+	dataKey, err := destination.ParseKey(os.Getenv("FERRY_DATA_KEY"))
+	if err != nil {
+		return fmt.Errorf("FERRY_DATA_KEY (create one with `openssl rand -base64 32`): %w", err)
+	}
 
 	// Cancelled on Ctrl-C or SIGTERM, which starts a graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -79,23 +88,31 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("open house accounts: %w", err)
 	}
 
-	// M3 has only the mock rail; the Noah adapter replaces it in M5.
-	rl := mock.New(time.Now)
-	rl.AutoSettle = dev
-	payouts := payout.NewService(pool, rl, house, time.Now)
+	rl, err := railFromEnv(dev)
+	if err != nil {
+		return err
+	}
+	dests, err := destination.NewStore(pool, rl.Name(), dataKey)
+	if err != nil {
+		return err
+	}
+	payouts := payout.NewService(pool, rl, dests, house, time.Now)
 
-	// The mock rail lives in this process's memory, so the worker that
-	// submits to it must run here too. With a shared rail (M5) the relay
-	// and worker run as their own binaries (cmd/relay, cmd/worker).
+	// In dev the relay, worker and resolver run in this process. The mock
+	// rail lives in this process's memory, so with it they must; with
+	// Noah they may also run as their own binaries (cmd/relay, cmd/worker).
 	var background sync.WaitGroup
 	bgCtx, stopBackground := context.WithCancel(context.Background())
 	defer func() { stopBackground(); background.Wait() }()
-	if dev {
+	switch {
+	case dev:
 		if err := startBackground(bgCtx, &background, pool, payouts, log); err != nil {
 			return err
 		}
-	} else {
-		log.Warn("payouts will stay held: no worker runs outside dev mode until the Noah rail (M5)")
+	case rl.Name() == "mock":
+		log.Warn("payouts will stay held: the mock rail cannot serve a separate worker; use FERRY_ENV=dev or FERRY_RAIL=noah")
+	default:
+		log.Info("payouts are submitted by cmd/worker", "rail", rl.Name())
 	}
 
 	addresses, err := depositAddresses(ctx, pool, log)
@@ -104,14 +121,15 @@ func run(log *slog.Logger) error {
 	}
 
 	handler := api.New(api.Config{
-		Pool:      pool,
-		Payouts:   payouts,
-		Idem:      idempotency.NewStore(pool, time.Now, 30*time.Second, log),
-		House:     house,
-		Addresses: addresses,
-		AdminKey:  adminKey,
-		Dev:       dev,
-		Log:       log,
+		Pool:         pool,
+		Payouts:      payouts,
+		Destinations: dests,
+		Idem:         idempotency.NewStore(pool, time.Now, 30*time.Second, log),
+		House:        house,
+		Addresses:    addresses,
+		AdminKey:     adminKey,
+		Dev:          dev,
+		Log:          log,
 	})
 	srv := &http.Server{
 		Addr:              addr,
@@ -166,6 +184,21 @@ func startBackground(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool
 	wg.Go(func() { resolver.Run(ctx, 5*time.Second) })
 	log.Info("background started", "relay", true, "worker", true, "resolver", true, "sqs", os.Getenv("FERRY_SQS_QUEUE_URL") != "")
 	return nil
+}
+
+// railFromEnv picks the payout rail: the in-memory mock (default; in dev it
+// settles at once) or Noah.
+func railFromEnv(dev bool) (rail.Rail, error) {
+	switch name := os.Getenv("FERRY_RAIL"); name {
+	case "", "mock":
+		m := mock.New(time.Now)
+		m.AutoSettle = dev
+		return m, nil
+	case "noah":
+		return noah.FromEnv(os.Getenv, time.Now)
+	default:
+		return nil, fmt.Errorf("unknown FERRY_RAIL %q (want mock or noah)", name)
+	}
 }
 
 // depositAddresses sets up deposit address assignment for every
