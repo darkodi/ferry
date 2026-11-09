@@ -93,3 +93,21 @@ WHERE status = @status
   AND updated_at <= now() - make_interval(secs => @stale_secs::int)
 ORDER BY updated_at
 LIMIT @max_rows;
+
+-- name: PayoutForRailTx :one
+-- The payout a rail transaction belongs to, for the named rail.
+SELECT r.payout_id FROM rail_transactions r
+JOIN quotes q ON q.payout_id = r.payout_id
+WHERE r.rail_tx_id = @rail_tx_id AND q.rail = @rail
+LIMIT 1;
+
+-- name: MaxRailEventVersion :one
+SELECT coalesce(max(event_version), 0)::bigint FROM rail_events
+WHERE rail = @rail AND rail_tx_id = @rail_tx_id;
+
+-- name: InsertRailEvent :one
+-- Returns no row for a redelivered event (same rail, transaction, version).
+INSERT INTO rail_events (rail, event_type, rail_tx_id, event_version, occurred, payload, payout_id)
+VALUES (@rail, @event_type, @rail_tx_id, @event_version, @occurred, @payload, @payout_id)
+ON CONFLICT (rail, rail_tx_id, event_version) DO NOTHING
+RETURNING id;

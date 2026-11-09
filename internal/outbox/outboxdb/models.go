@@ -162,6 +162,18 @@ type Quote struct {
 	CreatedAt        time.Time
 }
 
+type RailEvent struct {
+	ID           int64
+	Rail         string
+	EventType    string
+	RailTxID     string
+	EventVersion int64
+	Occurred     *time.Time
+	Payload      []byte
+	PayoutID     *uuid.UUID
+	ReceivedAt   time.Time
+}
+
 type RailTransaction struct {
 	ID               int64
 	PayoutID         uuid.UUID

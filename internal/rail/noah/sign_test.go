@@ -128,3 +128,5 @@ func TestParseSigningKey(t *testing.T) {
 		}
 	}
 }
+
+func ecdsaKey() (*ecdsa.PrivateKey, error) { return ecdsa.GenerateKey(elliptic.P384(), rand.Reader) }

@@ -13,7 +13,7 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | M2 — Payout API + state machine | done |
 | M3 — Events (outbox relay, workers, resolver) | done |
 | M4 — Chains (EVM and Solana deposits) | done |
-| M5 — Noah rail (destinations, signed adapter, standalone worker; webhooks next) | in progress |
+| M5 — Noah rail (destinations, signed adapter, webhooks, returns; sandbox run pending a key) | done |
 | M6–M7 | planned |
 
 What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Customers get their own EVM deposit address, derived from an xpub so Ferry never holds the key. `cmd/watcher` reads USDC transfers to those addresses, shows them as pending, and credits them after N confirmations. It handles reorgs by rewinding and orphaning, and re-checks every block hash before crediting. On Solana, each customer gets a token account at a seed-derived address. The watcher creates it on-chain (signing with a key that can create accounts but cannot move funds), reads only finalized slots, and credits a deposit as soon as it sees it. The treasury sweep out of deposit addresses comes later.
@@ -136,7 +136,16 @@ NOAH_API_KEY=... go test ./internal/rail/noah -run Sandbox -v          # channel
 NOAH_API_KEY=... NOAH_SANDBOX_SELL=1 go test ./internal/rail/noah -run Sandbox -v  # also a 1 USD sale
 ```
 
-Noah webhooks (so payouts settle without polling) come in the next PR.
+**Webhooks.** Noah's webhooks settle payouts without waiting for the resolver. To see it with the fake, give it a webhook signing key and Ferry the public half:
+
+```bash
+openssl ecparam -name secp384r1 -genkey -noout -out /tmp/noah-webhook.pem
+openssl ec -in /tmp/noah-webhook.pem -pubout -out /tmp/noah-webhook.pub.pem
+FAKE_NOAH_WEBHOOK_URL=http://127.0.0.1:8080/v1/webhooks/noah FAKE_NOAH_WEBHOOK_KEY=/tmp/noah-webhook.pem make fake-noah
+# in .env: NOAH_WEBHOOK_PUBLIC_KEY=/tmp/noah-webhook.pub.pem
+```
+
+Settling at the fake now moves the payout to `settled` within a second. `POST localhost:18090/_control/transactions/<ID>/reverse` sends a bank return, and the payout becomes `reversed`. Against the real sandbox, leave `NOAH_WEBHOOK_PUBLIC_KEY` empty (Noah's published key is built in) and expose `/v1/webhooks/noah` through a tunnel such as cloudflared.
 
 ## License
 

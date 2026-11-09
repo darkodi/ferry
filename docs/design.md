@@ -454,7 +454,7 @@ Read from docs.noah.com before writing the adapter (`internal/rail/noah`):
 - **Prices have no expiry.** Prepare returns `CryptoAuthorizedAmount` and a `FormSessionID`, but no expiry. Its fixed-quote option cannot be passed to the sell call. Ferry therefore sets its own quote TTL (`NOAH_QUOTE_TTL`, default 2 minutes). The authorized amount already carries Noah's buffer for price moves; Ferry holds exactly that and sends it back unchanged.
 - **`EventVersion` is only on webhooks.** `GET /transactions/{id}` returns the current state with no version. The adapter ranks progress instead: Pending = 1, Settled or Failed = 2. The core moves money only when the rank increases; at an equal rank it records a new sub-status (a review moving on) and nothing else.
 - **Settled amounts come from `Breakdown`, which is in crypto.** `Remaining` is what paid the bank (Ferry's `Spent`); `ChannelFee` + `BusinessFee` is the `Fee`. They must add up to `Amount`. A missing or inconsistent breakdown fails closed: nothing is posted and the payout stays `submitted` for a human.
-- **A return is a new transaction.** Its `Reverses` points at the original, which stays `Settled`, and `GET /transactions` cannot filter by `ExternalID`. Finding returns is part of the webhook work (M5 PR 2).
+- **A return is a new transaction.** It is incoming, already `Settled`, and its `Reverses` points at the original, which stays `Settled`. `GET /transactions` cannot filter by `Reverses`, so when `Get` sees a settled sale it pages through transactions created since then, oldest first, at most 10 pages. A match is reported as `Return` at progress rank 3, and the core books `settled → reversed` for the returned amount. Its `Amount` is "crypto at market rate at time of reversal" and may differ from what was spent; a return above `Spent` stops for a human (`ErrRailMismatch`), as the M2 rule says. Noah may follow a reversal with an on-chain `AdjustmentFor` transaction; it carries no `Reverses`, matches no payout, and is only stored.
 - **Payouts are first-party.** Ferry sells from its own balance under its own KYB, so sell calls omit `CustomerID`. Mapping each Ferry customer to a Noah customer (the Reliance model, `PUT /customers/{id}` with KYB data) is later work.
 
 **Destinations.** Noah prices a payout against a channel plus a bank-details form, or a saved `PaymentMethodID`. A customer therefore registers a bank account once (`POST /v1/destinations`: country, currency, payment method type such as `BankAch`, and the form), and a payout names it by `destination_id`.
@@ -472,6 +472,17 @@ Read from docs.noah.com before writing the adapter (`internal/rail/noah`):
 | 401, 409, 429, 5xx, timeout | an unknown-outcome error | stays `held` with `needs_resolution`; the resolver resends with the same Nonce |
 
 The lookup matters because a 400 on its own is not proof: if an earlier attempt with this nonce went through and its answer was lost, a resend could be refused for another reason.
+
+**Webhooks** (`POST /v1/webhooks/noah`, no API key: the signature is the authentication). The order of steps is what makes it safe:
+1. Read at most 1 MiB and verify `Webhook-Signature` (ECDSA P-384, SHA-384, base64 DER) over the raw bytes, before any parsing. Noah's published sandbox and production keys are pinned in code; `NOAH_WEBHOOK_PUBLIC_KEY` overrides them (the fake, or a key rotation). A bad signature gets 401 and nothing is stored.
+2. Parse the envelope. Unknown fields are allowed. `EventType` is compared case-insensitively (the docs show both cases). Other event types get 200 and are dropped.
+3. In one transaction (`payout.Service.RecordRailEvent`):
+   - insert into `rail_events`, keyed `(rail, rail_tx_id, event_version)` (a redelivery is a no-op);
+   - match the payout by its rail transaction id, or by `Reverses` for a return;
+   - write an outbox `rail.sync` only if `EventVersion` is newer than every stored event for that transaction.
+4. Answer 200. A failure before the commit answers 5xx, and Noah retries (up to 7 times).
+
+The worker consumes `rail.sync` (inbox de-duplication) and calls `Sync`, which fetches the transaction from Noah and applies what Noah says now. **A webhook never moves money**: a correctly signed event that claims `Settled` changes nothing until Noah's own answer agrees. An event can arrive before Ferry has recorded the transaction id (Noah's creation webhook can race the submit response). It is then stored unmatched; the submit itself applies that state, and the resolver catches anything later.
 
 **Request signing.** Every request carries `X-Api-Key` and, when a key is configured, an `Api-Signature` JWT. It is signed with ES384 and carries the claims `aud`, `iat`, `exp` (5 minutes), `method`, `path`, `queryParams` and `bodyHash` (the SHA-256 of the exact bytes sent). The signer uses only the standard library. A production base URL without a signing key is refused at startup, and the client never follows redirects.
 
@@ -516,11 +527,12 @@ This table is the section an interviewer will probe; each row should have a test
 | Submit refused after an unknown outcome | Hold released while the money is moving | On 400/402/403 look the payout up by `ExternalID` before reporting a rejection | Noah fake: created then 400 → `submitted`, hold kept |
 | Rail settles with an unexplained amount | Wrong `settle` posting | `Breakdown` must add up to `Amount`, else nothing is applied | Noah fake: inconsistent breakdown → stays `submitted` |
 | Destination's bank details tampered with in the database | Payout to an attacker's account | AES-GCM with the row id as associated data; decryption fails closed | Ciphertext copied to another row → refused |
-| Duplicate webhook | Double settle | Inbox dedup; state check `submitted → settled` only | Send webhook 3× |
-| Out-of-order webhook | Old `Pending` overwrites `Settled` | Apply only if `EventVersion` is newer | Deliver Settled, then an older Pending |
+| Duplicate webhook | Double settle | `rail_events` unique key; inbox dedup; state check `submitted → settled` only | Send webhook 3× (mock: repeated sync; Noah: one stored row, one re-fetch) |
+| Out-of-order webhook | Old `Pending` overwrites `Settled` | Queue a re-fetch only if `EventVersion` is newer; the re-fetch reads Noah's current state | Deliver a newer event, then an older one: stored, not queued |
+| Webhook for an unknown transaction | Applied to the wrong payout | Matched by the rail transaction id (and rail); otherwise stored unmatched | Signed event for an unknown id → stored, `payout_id` empty |
 | Webhook never arrives | Payout stuck in `submitted` | Poller for payouts older than SLA with no review in progress; alert | Drop webhook; assert poller settles |
 | Compliance review | False stuck alert, or a payout cancelled by mistake | Alert reads sub-status; no auto-cancel while under review | Mock 10-day review, then approve and then reject |
-| Bank returns a settled payout | Customer never credited | `settled → reversed` on a `Reverses` event | Mock return 3 days after settle |
+| Bank returns a settled payout | Customer never credited | `settled → reversed` on a `Reverses` event | Mock return 3 days after settle; Noah fake: reversal webhook → `reversed`, credited once |
 | Return amount differs | Ledger off by return fees or FX | Credit only the returned amount; customer bears the shortfall (v1 policy) | Return less than the original |
 | Outbox relay crash after publish | Duplicate event | Idempotent consumers | Kill relay between publish and mark |
 | Chain reorg | Credit for a vanished deposit | Credit only after confirmation; block-hash check | Simulated reorg on local Anvil |
@@ -528,7 +540,7 @@ This table is the section an interviewer will probe; each row should have a test
 | Solana deposit address pre-funded by a stranger | `createAccountWithSeed` fails; the address never becomes usable | Detect a bare system account; top up rent and `allocateWithSeed` | SOL sent before provisioning; address still becomes `active` |
 | Watcher stops between creating a Solana account and activating it | A deposit in between is missed | Provisioning addresses are watched; provisioning is idempotent | Second provision sends nothing |
 | Quote expires mid-flow | Executing at stale price | Expiry checked inside hold tx | Advance clock past expiry |
-| Forged webhook | Fake settlement | ECDSA signature check; event re-fetched from rail before money moves | Unsigned and tampered payloads rejected |
+| Forged webhook | Fake settlement | ECDSA signature check; event re-fetched from rail before money moves | Another key → 401, nothing stored; a signed event claiming Settled moves nothing while Noah says Pending |
 | Postgres failover | Lost in-flight tx | Every step re-entrant from persisted state | Restart DB mid-test |
 | Poison message | Consumer stuck | Max receive count → DLQ + alert | Malformed event |
 
@@ -584,7 +596,7 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 | POST | `/v1/payouts/{id}/confirm` | Places hold, enqueues submit |
 | GET | `/v1/payouts/{id}` | State, quote, timeline of transitions |
 | GET | `/v1/ledger/entries?account_id=` | Paginated postings (cursor-based) |
-| POST | `/v1/webhooks/rail/{rail}` | Inbound rail events |
+| POST | `/v1/webhooks/{rail}` | Inbound rail events (`noah`): signature-verified, stored, then a re-fetch is queued |
 
 Publish it as an OpenAPI spec; generate the server stubs with `oapi-codegen`.
 
@@ -618,7 +630,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 2. **M2 — Payout API + state machine.** Idempotency, holds, mock rail, failure paths.
 3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
 4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test. *(done; the treasury sweep is deferred, see Blockchain integration)*
-5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox. *(PR 1: destinations, signed adapter, standalone worker; PR 2: webhooks and returns)*
+5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox. *(done: destinations, signed adapter, standalone worker, verified webhooks and returns; the real sandbox is still to be run once a key exists)*
 6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard.
 7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video.
 

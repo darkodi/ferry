@@ -17,8 +17,12 @@
 package noahtest
 
 import (
+	"bytes"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,6 +36,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/rail/noah"
@@ -90,6 +96,13 @@ type Server struct {
 	faults   []Fault
 	calls    []string
 	signed   int
+
+	// Webhooks (EnableWebhooks).
+	hookURL  string
+	hookKey  *ecdsa.PrivateKey
+	hookAuto bool
+	hookVer  int64
+	pending  [][]byte // envelopes not yet delivered, oldest first
 }
 
 type session struct {
@@ -141,6 +154,99 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"Items": out})
 	})
 	return mux
+}
+
+// ---- webhooks ----
+
+// EnableWebhooks makes the fake send a signed Transaction webhook to url
+// after every change, as Noah does. With auto, each is POSTed at once in
+// the background; otherwise tests call DeliverWebhooks.
+func (s *Server) EnableWebhooks(url string, key *ecdsa.PrivateKey, auto bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hookURL, s.hookKey, s.hookAuto = url, key, auto
+}
+
+// SignWebhook signs a body the way Noah does: ECDSA P-384 over SHA-384,
+// ASN.1, base64 in the Webhook-Signature header.
+func SignWebhook(key *ecdsa.PrivateKey, body []byte) (string, error) {
+	digest := sha512.Sum384(body)
+	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
+	if err != nil {
+		return "", fmt.Errorf("noahtest: sign webhook: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(sig), nil
+}
+
+// emit queues a webhook for t's current state. Called with s.mu held.
+func (s *Server) emit(t *noah.Transaction) {
+	if s.hookURL == "" {
+		return
+	}
+	// Noah's EventVersion looks like a millisecond timestamp; keep it
+	// strictly increasing even within one millisecond.
+	s.hookVer = max(s.hookVer+1, s.now().UnixMilli())
+	body, err := json.Marshal(map[string]any{
+		"Data": t, "EventType": "Transaction", "EventVersion": s.hookVer,
+		"Occurred": s.now().UTC().Format(time.RFC3339), "UserID": "fake-user",
+	})
+	if err != nil {
+		return
+	}
+	s.pending = append(s.pending, body)
+	if s.hookAuto {
+		go func() { _, _ = s.DeliverWebhooks() }()
+	}
+}
+
+// PendingWebhooks returns the webhooks not yet delivered, oldest first.
+func (s *Server) PendingWebhooks() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.pending)
+}
+
+// DeliverWebhooks POSTs every pending webhook in order and reports how
+// many were accepted (2xx). A refused one stays pending, as Noah retries.
+func (s *Server) DeliverWebhooks() (int, error) {
+	s.mu.Lock()
+	url, key, queue := s.hookURL, s.hookKey, s.pending
+	s.pending = nil
+	s.mu.Unlock()
+	sent := 0
+	for i, body := range queue {
+		if err := PostWebhook(url, key, body); err != nil {
+			s.mu.Lock()
+			s.pending = append(slices.Clone(queue[i:]), s.pending...)
+			s.mu.Unlock()
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
+}
+
+// PostWebhook signs body with key and POSTs it to url.
+func PostWebhook(url string, key *ecdsa.PrivateKey, body []byte) error {
+	sig, err := SignWebhook(key, body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body)) //nolint:noctx // test helper
+	if err != nil {
+		return fmt.Errorf("noahtest: webhook request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Webhook-Signature", sig)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("noahtest: deliver webhook: %w", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("noahtest: webhook answered %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // ---- test controls ----
@@ -197,6 +303,32 @@ func (s *Server) SetSubStatus(id, sub, rfi string) error {
 	})
 }
 
+// Reverse records a bank return of a settled sale, as Noah does: a new
+// incoming, settled transaction whose Reverses is the original's id. The
+// original stays Settled. It returns the new transaction's id.
+func (s *Server) Reverse(id, amountStr string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	orig, ok := s.txs[id]
+	if !ok || orig.Status != "Settled" {
+		return "", fmt.Errorf("noahtest: transaction %s is not a settled sale", id)
+	}
+	s.seq++
+	t := &noah.Transaction{
+		ID:             uuid.NewString(), // Noah ids are UUIDs, unique across runs
+		Created:        s.now().UTC().Truncate(time.Second),
+		Status:         "Settled",
+		Direction:      "In",
+		CryptoCurrency: orig.CryptoCurrency,
+		Amount:         amountStr,
+		Reverses:       id,
+	}
+	s.txs[t.ID] = t
+	s.order = append(s.order, t.ID)
+	s.emit(t)
+	return t.ID, nil
+}
+
 // Transactions returns every transaction, oldest first.
 func (s *Server) Transactions() []noah.Transaction {
 	s.mu.Lock()
@@ -233,6 +365,7 @@ func (s *Server) update(id string, f func(*noah.Transaction, session)) error {
 		return fmt.Errorf("noahtest: transaction %s is %s, not Pending", id, t.Status)
 	}
 	f(t, s.sessionOf(t))
+	s.emit(t)
 	return nil
 }
 
@@ -249,8 +382,22 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		err = s.Fail(id)
 	case "review":
 		err = s.SetSubStatus(id, "UnderReview", "AwaitingCustomer")
+	case "reverse":
+		// Return what reached the bank (the Remaining line), as a bank
+		// return of the full payout would.
+		var amt string
+		s.mu.Lock()
+		if t, ok := s.txs[id]; ok {
+			for _, b := range t.Breakdown {
+				if b.Type == "Remaining" {
+					amt = b.Amount
+				}
+			}
+		}
+		s.mu.Unlock()
+		_, err = s.Reverse(id, amt)
 	default:
-		err = fmt.Errorf("unknown action %q (settle, fail, review)", r.PathValue("action"))
+		err = fmt.Errorf("unknown action %q (settle, fail, review, reverse)", r.PathValue("action"))
 	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "InvalidMessage", err.Error())
@@ -416,7 +563,7 @@ func (s *Server) prepare(w http.ResponseWriter, _ *http.Request, body []byte) {
 	needed := ledger.Amount(cents * microPerCent)
 	fee := needed / feeDivisor
 	s.seq++
-	sid := fmt.Sprintf("00000000-0000-4000-8000-%012d", s.seq)
+	sid := uuid.NewString()
 	ss := session{
 		channel: *ch, fiat: in.FiatAmount, fiatMinor: cents, needed: needed, fee: fee,
 		authorized: amount(needed + fee + needed/bufferDivisor), pmID: pmID,
@@ -481,7 +628,7 @@ func (s *Server) sell(w http.ResponseWriter, _ *http.Request, body []byte) {
 	}
 	s.seq++
 	t := &noah.Transaction{
-		ID:             fmt.Sprintf("10000000-0000-4000-8000-%012d", s.seq),
+		ID:             uuid.NewString(), // Noah ids are UUIDs, unique across runs
 		Created:        s.now().UTC().Truncate(time.Second),
 		Status:         "Pending",
 		SubStatus:      "AmlScreening",
@@ -497,6 +644,7 @@ func (s *Server) sell(w http.ResponseWriter, _ *http.Request, body []byte) {
 	s.byNonce[in.Nonce] = t.ID
 	delete(s.sessions, in.FormSessionID)
 	s.sessions["used:"+t.ID] = ss // keep the price for Settle
+	s.emit(t)
 	if fault != nil {
 		writeErr(w, fault.Status, fault.Type, "injected fault after creating the transaction")
 		return
@@ -538,6 +686,9 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, _ []byte) {
 		if t := s.txs[s.order[i]]; !t.Created.Before(from) {
 			all = append(all, t)
 		}
+	}
+	if q.Get("SortDirection") == "ASC" {
+		slices.Reverse(all)
 	}
 	if start > len(all) {
 		start = len(all)

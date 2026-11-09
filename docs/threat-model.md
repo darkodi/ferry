@@ -13,6 +13,7 @@ STRIDE analysis per component and trust boundary. Each component adds its sectio
 | TB5 | Chain RPC node → watcher | JSON-RPC responses: headers, block hashes, logs (EVM); slots, signatures, transactions with token balances (Solana) | M4 |
 | TB6 | Solana watcher → Solana cluster | Account-creation transactions signed with the authority key | M4 |
 | TB7 | Ferry → Noah Business API | HTTPS requests with the API key and an ES384 request signature; customer bank details in prepare bodies | M5 |
+| TB8 | Internet → webhook endpoint | Noah's Transaction webhooks: a public route authenticated only by the body's ECDSA signature | M5 |
 
 Later milestones add the public API, inbound rail webhooks, chain RPC and the queue.
 
@@ -234,7 +235,7 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 
 ## Noah rail adapter and destinations (M5)
 
-`internal/rail/noah` talks to Noah over TB7; `internal/destination` stores the bank accounts payouts go to. Webhooks (inbound) are the next PR.
+`internal/rail/noah` talks to Noah over TB7; `internal/destination` stores the bank accounts payouts go to. Webhooks (TB8) are below.
 
 **Assets:**
 - the Noah API key and request-signing key (together they can spend Ferry's pre-funded balance);
@@ -273,3 +274,34 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 - **The lookup by `ExternalID` is bounded** to the last 7 days and 10 pages of 100 transactions. If the page limit is reached first, the outcome is reported as unknown and the hold is kept. A sale older than 7 days would not be found. That is unrealistic, because the resolver resends within minutes of an unclear answer.
 - **The masked display can reveal the last four digits.** That is standard practice, but it is still personal data in the API response.
 
+## Noah webhooks (M5)
+
+`POST /v1/webhooks/noah` is public: anyone on the internet can reach it, and the only authentication is Noah's signature over the body (TB8).
+
+**Assets:** payout state, and the customer balances it drives; the endpoint's availability (Noah retries only 7 times).
+
+**Assumptions:**
+- Attackers can send any bytes and replay any webhook they have seen.
+- A real Noah webhook can arrive twice, out of order, or before Ferry has recorded the transaction id.
+- Noah's signing key is safe; the published public keys are authentic (fetched from docs.noah.com and pinned in code).
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: forged webhook | "Settled" for a payout Noah never paid | ECDSA P-384 signature over the raw body, checked before parsing, against Noah's pinned key; 401 and nothing stored | `TestWebhookSignatureRequired`, `TestNoahForgedWebhookRefused` |
+| **S**poofing: config swaps the key | An attacker who can set env points verification at their key | Real environments use keys pinned in code; the override is a file path, for the fake | `TestPublishedWebhookKeys` |
+| **T**ampering: a signed event that lies, or a compromised Noah key | A valid signature on a false "Settled" | A webhook never moves money: the worker re-fetches the transaction from Noah's API (TB7, signed) and applies that | `TestNoahForgedWebhookRefused` (signed half) |
+| **T**ampering: replay | An old signed event resent | Unique `(rail, rail_tx_id, event_version)`; re-fetch queued only for a newer version; Sync is idempotent | `TestNoahWebhookReplayAndOrder` |
+| **T**ampering: wrong payout | An event for another business's transaction | Matched by rail transaction id and rail; unmatched events are stored, not applied; the core also checks `ExternalID` on every apply | `TestNoahWebhookUnknownTransaction` |
+| **R**epudiation | "We never got the webhook" | Every verified event is stored with its body before 2xx | `TestNoahWebhookSettlesPayout` (stored rows) |
+| **D**enial of service: floods and big bodies | Many or huge requests | 1 MiB limit; verification before any database work; invalid signatures cost one ECDSA check | `TestWebhookSignatureRequired` |
+| **D**enial of service: lost webhooks | Noah gives up after 7 tries during an outage | The resolver polls stale `submitted` payouts, so webhooks only make things faster | `TestResolverWaitsOutReviewThenSettles` |
+| **E**levation of privilege | The webhook route reaches customer or admin routes | It is outside both auth groups and calls only `RecordRailEvent` | — |
+
+### Residual risks
+
+- **No rate limit or IP allowlist yet.** Noah publishes webhook IPs; an allowlist at the load balancer (M7) would cut the noise before the signature check.
+- **A large reversal amount stops for a human.** Noah reports a reversal at the market rate, which may exceed what was spent; Ferry then logs `ErrRailMismatch` and leaves the payout `settled`. The alert arrives with M6.
+- **The step after a reversal is unverified.** For pre-funded payouts, it's not yet known whether Noah's follow-up on-chain `AdjustmentFor` transaction ever moves Ferry's balance. Until the sandbox shows it, such transactions are stored, not applied.
+- **Return lookup is bounded** to 10 pages of transactions after the sale. A return Noah books much later and buried under heavy traffic would be missed until reconciliation (M6).
