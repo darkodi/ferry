@@ -274,7 +274,7 @@ Each step below is one database transaction that changes state, writes ledger po
 
 1. Chain watcher sees a USDC `Transfer` (EVM) or token transfer (Solana) to a customer's deposit address.
 2. Insert `deposits` row keyed by `(chain, tx_hash, log_index)` with status `pending`. Duplicate detection is the unique key.
-3. When confirmations reach the chain's threshold, check that the deposit's block hash is still the one on the chain, then mark `confirmed` and post a `deposit` entry and the `deposit.confirmed` event in one transaction. If the hash changed, orphan the deposit and rescan from just before its block.
+3. When confirmations reach the chain's threshold (0 on Solana, which reads only finalized slots), check that the deposit's block hash is still the one on the chain, then mark `confirmed` and post a `deposit` entry and the `deposit.confirmed` event in one transaction. If the hash changed, orphan the deposit and rescan from just before its block.
 4. If the block is reorged out before confirmation, mark `orphaned`; nothing was posted, so nothing to reverse.
 5. If the same transfer is included again in a new block (nodes return the transactions of dropped blocks to their mempool), the orphaned row goes back to `pending` at its new block. It is still one deposit, credited at most once.
 6. A *confirmed* deposit above a fork point (a reorg deeper than the confirmation depth) is never undone automatically: the watcher logs it, and a human posts a `correction`.
@@ -377,8 +377,9 @@ type Adapter interface {
 }
 ```
 
-`chain.Watcher` is the chain-agnostic engine around an adapter. Each round it does three things:
+`chain.Watcher` is the chain-agnostic engine around an adapter. Each round it does up to four things:
 
+0. **Provision** (Solana only). It creates the on-chain accounts of addresses still `provisioning` and marks them `active`.
 1. **Reorg check.** It compares the stored hash of the cursor block with the chain's.
 2. **Scan.** It reads the next block range and stores pending deposits and the new cursor in one transaction.
 3. **Confirm.** It verifies each deposit's block hash, then credits it.
@@ -387,10 +388,11 @@ A Postgres advisory lock keeps one active watcher per chain; a second copy stand
 
 | Concern | EVM testnet (e.g. Sepolia / Base Sepolia) | Solana devnet |
 | --- | --- | --- |
-| Detect deposits | `eth_getLogs` for USDC `Transfer` to known addresses, in block ranges | `getSignaturesForAddress` on each deposit token account, then `getTransaction` |
-| Finality | N confirmations (configurable) or the `finalized` tag | `finalized` commitment |
-| Reorg handling | Store the hash of each scanned range's last block and of every deposit's block; when the cursor block's hash changes, rewind to the newest stored block still on the chain, orphan pending deposits above it and re-scan. Before crediting, re-check the deposit's block hash | Use only `finalized`; reorg risk handled by commitment level |
-| Deposit addresses | BIP-32 from an account xpub (`m/44'/60'/0'`): customer *i* gets `xpub/0/i`. Ferry holds only the xpub, so it can compute every address but spend from none | A token account per customer at a seed-derived address (`createWithSeed` from Ferry's authority key), created on-chain by the watcher before it is `active` |
+| Detect deposits | `eth_getLogs` for USDC `Transfer` to known addresses, in block ranges | `getSignaturesForAddress` (finalized) on each deposit token account, paging back to the scanned slot range, then `getTransaction` once per signature. The credit is the account's USDC balance increase (post minus pre token balance), so `Transfer`, `TransferChecked` and transfers made by other programs all count |
+| Transfer identity | `(tx_hash, log_index)` | `(signature, account index in the transaction)`, stored in the same columns |
+| Finality | N confirmations (configurable) or the `finalized` tag | `finalized` commitment only, so `Confirmations = 0`: a deposit is credited in the round that first sees it |
+| Reorg handling | Store the hash of each scanned range's last block and of every deposit's block; when the cursor block's hash changes, rewind to the newest stored block still on the chain, orphan pending deposits above it and re-scan. Before crediting, re-check the deposit's block hash | Finalized slots cannot be rolled back, so the shared rewind code never fires. A skipped slot has no block; its hash is recorded as `skipped`, which never changes once the slot is finalized |
+| Deposit addresses | BIP-32 from an account xpub (`m/44'/60'/0'`): customer *i* gets `xpub/0/i`. Ferry holds only the xpub, so it can compute every address but spend from none | A token account per customer at `createWithSeed(authority, "ferry-<i>", Token program)`. The API computes it from the authority's public key. The watcher creates it and only then marks it `active`. Its token owner is a separate **deposit owner** whose private key Ferry never holds, so the key that creates accounts cannot spend from them |
 | Outbound (treasury sweep) | Nonce manager: reserve nonce in Postgres, sign, store raw tx before broadcast, rebroadcast same raw tx | Recent blockhash + durable record of signature before send; re-check status before re-sending |
 
 Design notes:
@@ -400,7 +402,16 @@ Design notes:
 - **Keys.** Local dev keys in env vars; on AWS, KMS for signing (EVM `secp256k1` keys are supported). Never in the database.
 - **Scope cut.** Payouts in this project go to fiat via the rail, so on-chain outbound is limited to a treasury sweep from deposit addresses to an omnibus wallet. The sweep is deferred past M4: it needs signing keys, gas top-ups for EVM deposit addresses and a nonce manager, and changes no ledger rule (`chain_omnibus` already covers USDC in deposit addresses).
 - **Untrusted RPC.** Every log is re-checked: the contract address, the event signature, the recipient, the block range, `removed`, and an amount that fits int64 minor units. Amounts above it are refused, never truncated.
-- **Local chain.** Anvil (docker compose) with `contracts/TestUSDC.sol`, a 6-decimal test token; tests use go-ethereum's in-process simulated backend, whose `Fork` makes real reorgs.
+- **Local chain.** Anvil (docker compose) with `contracts/TestUSDC.sol`, a 6-decimal test token; tests use go-ethereum's in-process simulated backend, whose `Fork` makes real reorgs. For Solana, `solana-test-validator` (Agave image, docker compose and testcontainers) with a 6-decimal test mint from `make chain-setup`.
+
+Solana keys and provisioning:
+
+- **Three keys, one secret.** The *authority* is the seed base of every deposit address and pays account rent. Its keypair file is read only by the Solana watcher (dev key in `.dev/`, KMS in M7). The *deposit owner* is the token owner of every deposit account, and only its key can move deposited USDC. Ferry holds just its public key; the private key belongs to the future sweep. The API needs only the authority's public key. The watcher refuses to start if the owner and the authority are the same key.
+- **Provisioning.** The address must hold an initialised token account before USDC can land there. Each round the watcher creates up to 20 missing accounts with `createAccountWithSeed` + `InitializeAccount3` (mint = USDC, owner = deposit owner), waits for confirmation, checks the account, and marks it `active`. It is idempotent: an existing account is only checked (owner program, size, mint, owner, state, no delegate or close authority) and never re-created. A failing address is logged and retried the next round, without stopping the scan.
+- **Pre-funded addresses.** Anyone can send SOL to a deposit address before its account exists, and the system program then refuses `createAccountWithSeed`. A bare system account is therefore topped up to rent exemption and turned into the token account with `allocateWithSeed` instead, so a stranger's dust cannot block a customer's address.
+- **Provisioning addresses are watched too.** If the watcher stops after creating an account but before marking it `active`, a deposit that lands in between is still found. The status shown by the API tells customers when to send.
+- **Address mismatch.** Before creating anything, the watcher recomputes the address from its own authority and the stored derivation index. If the API and watcher are configured with different authorities, it refuses.
+- **Untrusted RPC.** A transaction counts only if it succeeded, its first signature is the one asked for, and its slot is in the scanned range. A token balance counts only if its account index is in range and listed once, its mint is the USDC mint, its owner is the deposit owner, its program is the Token program, and its amounts are canonical integers. A credit above the int64 range is refused, never truncated.
 
 ## Rail integration (Noah)
 
@@ -471,6 +482,9 @@ This table is the section an interviewer will probe; each row should have a test
 | Return amount differs | Ledger off by return fees or FX | Credit only the returned amount; customer bears the shortfall (v1 policy) | Return less than the original |
 | Outbox relay crash after publish | Duplicate event | Idempotent consumers | Kill relay between publish and mark |
 | Chain reorg | Credit for a vanished deposit | Credit only after confirmation; block-hash check | Simulated reorg on local Anvil |
+| Watcher re-scans after a crash | Double credit | Unique `(chain, tx_hash, log_index)`; guarded `pending → confirmed`; ledger idempotency key | Cursor moved back on Anvil and on the Solana validator; one entry |
+| Solana deposit address pre-funded by a stranger | `createAccountWithSeed` fails; the address never becomes usable | Detect a bare system account; top up rent and `allocateWithSeed` | SOL sent before provisioning; address still becomes `active` |
+| Watcher stops between creating a Solana account and activating it | A deposit in between is missed | Provisioning addresses are watched; provisioning is idempotent | Second provision sends nothing |
 | Quote expires mid-flow | Executing at stale price | Expiry checked inside hold tx | Advance clock past expiry |
 | Forged webhook | Fake settlement | ECDSA signature check; event re-fetched from rail before money moves | Unsigned and tampered payloads rejected |
 | Postgres failover | Lost in-flight tx | Every step re-entrant from persisted state | Restart DB mid-test |
@@ -559,7 +573,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 1. **M1 — Ledger core.** Schema, posting rules, invariants, concurrency tests.
 2. **M2 — Payout API + state machine.** Idempotency, holds, mock rail, failure paths.
 3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
-4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test, sweep.
+4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test. *(done; the treasury sweep is deferred, see Blockchain integration)*
 5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox.
 6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard.
 7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video.

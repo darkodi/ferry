@@ -12,6 +12,8 @@ vendor/
 !.env.example
 *.pem
 *.key
+# Dev keypairs created by `make chain-setup` (Solana authority, wallet, mint)
+.dev/
 
 # Terraform
 .terraform/

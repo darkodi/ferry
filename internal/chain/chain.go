@@ -60,3 +60,13 @@ type Deriver interface {
 	// first.
 	Derive(index uint64) (address, status string, err error)
 }
+
+// Provisioner prepares deposit addresses that need an on-chain account
+// before they can receive funds (Solana token accounts). The Watcher calls
+// it at the start of each round for every address still "provisioning",
+// and marks the address "active" once it returns nil.
+type Provisioner interface {
+	// Provision makes the account for address (derivation index) ready.
+	// It must be idempotent: calling it for a ready account only checks it.
+	Provision(ctx context.Context, index uint64, address string) error
+}

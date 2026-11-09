@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,6 +21,8 @@ import (
 //
 // Each round (RunOnce):
 //
+//  0. Provision. If the chain needs on-chain accounts for its addresses
+//     (Provisioner set), create the missing ones and mark them active.
 //  1. Reorg check. If the block the cursor points at has a different hash
 //     now, walk the stored hashes back to the last block both forks share,
 //     orphan the pending deposits above it and move the cursor there.
@@ -54,6 +55,9 @@ type Watcher struct {
 	// KeepBlocks is how many recent block hashes are kept for reorg
 	// detection; a reorg deeper than this cannot be rewound automatically.
 	KeepBlocks uint64
+	// Provisioner, if set, creates on-chain accounts for addresses still
+	// "provisioning" at the start of each round.
+	Provisioner Provisioner
 }
 
 // NewWatcher returns a watcher with batches of 500 blocks and 1024 stored
@@ -68,11 +72,12 @@ var ErrDeepReorg = errors.New("chain: reorg deeper than stored block history")
 
 // Result summarises one round.
 type Result struct {
-	Rewound   bool
-	Scanned   uint64 // blocks scanned
-	Found     int    // new or revived pending deposits
-	Confirmed int
-	Orphaned  int
+	Provisioned int // addresses made active
+	Rewound     bool
+	Scanned     uint64 // blocks scanned
+	Found       int    // new or revived pending deposits
+	Confirmed   int
+	Orphaned    int
 }
 
 // Run holds the chain's leader lock and runs rounds every interval until
@@ -112,8 +117,8 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) error {
 			return err
 		case err != nil && ctx.Err() == nil:
 			w.log.ErrorContext(ctx, "watcher round", "error", err)
-		case res.Found+res.Confirmed+res.Orphaned > 0 || res.Rewound:
-			w.log.InfoContext(ctx, "watcher round", "scanned", res.Scanned, "found", res.Found,
+		case res.Provisioned+res.Found+res.Confirmed+res.Orphaned > 0 || res.Rewound:
+			w.log.InfoContext(ctx, "watcher round", "provisioned", res.Provisioned, "scanned", res.Scanned, "found", res.Found,
 				"confirmed", res.Confirmed, "orphaned", res.Orphaned, "rewound", res.Rewound)
 		}
 		// A full batch means there is more to catch up on.
@@ -139,6 +144,14 @@ func sleep(ctx context.Context, d time.Duration) bool {
 // directly); Run does.
 func (w *Watcher) RunOnce(ctx context.Context) (Result, error) {
 	var res Result
+	var err error
+	// 0. Provision.
+	if w.Provisioner != nil {
+		if res.Provisioned, err = w.provision(ctx); err != nil {
+			return res, err
+		}
+	}
+
 	head, err := w.chain.Head(ctx)
 	if err != nil {
 		return res, fmt.Errorf("chain: head: %w", err)
@@ -336,7 +349,7 @@ func (w *Watcher) scan(ctx context.Context, from, to uint64) (int, error) {
 }
 
 func (w *Watcher) watched(ctx context.Context) (map[string]uuid.UUID, error) {
-	rows, err := chaindb.New(w.pool).ActiveAddresses(ctx, w.chain.Chain())
+	rows, err := chaindb.New(w.pool).WatchedAddresses(ctx, w.chain.Chain())
 	if err != nil {
 		return nil, fmt.Errorf("chain: watched addresses: %w", err)
 	}
@@ -345,6 +358,37 @@ func (w *Watcher) watched(ctx context.Context) (map[string]uuid.UUID, error) {
 		m[r.Address] = r.CustomerID
 	}
 	return m, nil
+}
+
+// provision creates the on-chain accounts of addresses still
+// "provisioning" and marks them active. One address failing (say, the
+// authority is out of SOL) is logged and retried next round; it does not
+// stop the scan, and its deposits are still watched.
+func (w *Watcher) provision(ctx context.Context) (int, error) {
+	q := chaindb.New(w.pool)
+	rows, err := q.ProvisioningAddresses(ctx, chaindb.ProvisioningAddressesParams{Chain: w.chain.Chain(), MaxRows: 20})
+	if err != nil {
+		return 0, fmt.Errorf("chain: addresses to provision: %w", err)
+	}
+	n := 0
+	for _, r := range rows {
+		if err := w.Provisioner.Provision(ctx, uint64(r.DerivationIndex), r.Address); err != nil { //nolint:gosec // from a sequence with MINVALUE 0
+			if ctx.Err() != nil {
+				return n, fmt.Errorf("chain: provision: %w", ctx.Err())
+			}
+			w.log.ErrorContext(ctx, "provision deposit address", "address", r.Address, "error", err)
+			continue
+		}
+		done, err := q.ActivateAddress(ctx, chaindb.ActivateAddressParams{Chain: w.chain.Chain(), Address: r.Address})
+		if err != nil {
+			return n, fmt.Errorf("chain: activate address: %w", err)
+		}
+		if done == 1 {
+			n++
+			w.log.InfoContext(ctx, "deposit address provisioned", "address", r.Address)
+		}
+	}
+	return n, nil
 }
 
 func (w *Watcher) putBlock(ctx context.Context, q *chaindb.Queries, b Block) error {
@@ -371,7 +415,7 @@ func (w *Watcher) confirm(ctx context.Context, maxBlock uint64) (confirmed, orph
 		if err != nil {
 			return confirmed, orphaned, fmt.Errorf("chain: hash of block %d: %w", n, err)
 		}
-		if !strings.EqualFold(hash, d.BlockHash) {
+		if hash != d.BlockHash { // exact: Solana's base58 hashes are case-sensitive
 			if err := w.orphan(ctx, d, n); err != nil {
 				return confirmed, orphaned, err
 			}

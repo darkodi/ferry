@@ -11,6 +11,8 @@
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. http://localhost:9324
 //	FERRY_EVM_CHAIN      EVM chain name in the database (default evm-local)
 //	FERRY_EVM_XPUB       account xpub for customer deposit addresses; empty assigns none
+//	FERRY_SOLANA_CHAIN   Solana chain name in the database (default solana-local)
+//	FERRY_SOLANA_AUTHORITY  authority public key Solana deposit accounts derive from; empty assigns none
 package main
 
 import (
@@ -25,11 +27,13 @@ import (
 	"syscall"
 	"time"
 
+	sol "github.com/gagliardetto/solana-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/darkodi/ferry/internal/api"
 	"github.com/darkodi/ferry/internal/chain"
 	"github.com/darkodi/ferry/internal/chain/evm"
+	"github.com/darkodi/ferry/internal/chain/solana"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
@@ -164,29 +168,48 @@ func startBackground(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool
 	return nil
 }
 
-// depositAddresses sets up deposit address assignment from FERRY_EVM_XPUB
-// and gives existing customers an address on any newly configured chain.
+// depositAddresses sets up deposit address assignment for every
+// configured chain (FERRY_EVM_XPUB, FERRY_SOLANA_AUTHORITY) and gives
+// existing customers an address on any newly configured chain. Both are
+// public keys: the API can compute addresses but never move funds.
 func depositAddresses(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (*chain.Addresses, error) {
-	xpub := os.Getenv("FERRY_EVM_XPUB")
-	if xpub == "" {
-		log.Warn("FERRY_EVM_XPUB not set: new customers get no deposit address")
+	var ds []chain.Deriver
+	if xpub := os.Getenv("FERRY_EVM_XPUB"); xpub != "" {
+		d, err := evm.NewDeriver(envOr("FERRY_EVM_CHAIN", "evm-local"), xpub)
+		if err != nil {
+			return nil, err
+		}
+		ds = append(ds, d)
+	}
+	if auth := os.Getenv("FERRY_SOLANA_AUTHORITY"); auth != "" {
+		pk, err := sol.PublicKeyFromBase58(auth)
+		if err != nil {
+			return nil, fmt.Errorf("FERRY_SOLANA_AUTHORITY: %w", err)
+		}
+		d, err := solana.NewDeriver(envOr("FERRY_SOLANA_CHAIN", "solana-local"), pk)
+		if err != nil {
+			return nil, err
+		}
+		ds = append(ds, d)
+	}
+	if len(ds) == 0 {
+		log.Warn("no chain configured (FERRY_EVM_XPUB, FERRY_SOLANA_AUTHORITY): new customers get no deposit address")
 		return nil, nil
 	}
-	name := os.Getenv("FERRY_EVM_CHAIN")
-	if name == "" {
-		name = "evm-local"
-	}
-	d, err := evm.NewDeriver(name, xpub)
-	if err != nil {
-		return nil, err
-	}
-	a := chain.NewAddresses(d)
+	a := chain.NewAddresses(ds...)
 	n, err := a.Backfill(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("backfill deposit addresses: %w", err)
 	}
 	if n > 0 {
-		log.Info("assigned deposit addresses to existing customers", "count", n, "chain", name)
+		log.Info("assigned deposit addresses to existing customers", "count", n)
 	}
 	return a, nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

@@ -10,7 +10,8 @@ STRIDE analysis per component and trust boundary. Each component adds its sectio
 | TB2 | Operator / migrations → Postgres | SQL as the schema owner | M1 |
 | TB3 | Internet → API | HTTPS requests with a customer API key or the operator key | M2 |
 | TB4 | Ferry binaries ↔ queue | SQS messages (ElasticMQ locally) carrying outbox events | M3 |
-| TB5 | Chain RPC node → watcher | JSON-RPC responses: headers, block hashes, logs | M4 |
+| TB5 | Chain RPC node → watcher | JSON-RPC responses: headers, block hashes, logs (EVM); slots, signatures, transactions with token balances (Solana) | M4 |
+| TB6 | Solana watcher → Solana cluster | Account-creation transactions signed with the authority key | M4 |
 
 Later milestones add the public API, inbound rail webhooks, chain RPC and the queue.
 
@@ -194,3 +195,38 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 - **The topic filter lists every deposit address.** That is fine at portfolio scale; at volume, filter only by contract and match locally, or use a log indexer.
 - **Dust deposits are credited.** Without a minimum deposit, spam creates rows and tiny credits; a minimum and a sweep threshold come with the sweep.
 - **Funds in deposit addresses are not swept yet.** They are recorded under `chain_omnibus`, but moving them needs the sweep (deferred).
+
+## Solana deposits (M4)
+
+The Solana watcher shares the engine above (cursor, idempotent credit, leader lock); this section covers what is Solana-specific. Unlike the EVM side, it holds a private key: the **authority**, which is the seed base of every deposit address and pays account rent (TB6).
+
+**Assets:** the authority key and its SOL; the **deposit owner** (token owner of every deposit account, the only key that can move deposited USDC; Ferry holds only its public key); customer balances.
+
+**Assumptions:**
+
+- The RPC node (TB5) is untrusted, as for EVM. Ferry reads only `finalized` data, so a node can lag or lie but an honest node cannot roll a credited deposit back.
+- Anyone can send SOL or any token to any address, and can call any program in a transaction that touches a deposit account.
+- Only the operator creates customers, and each customer costs one account's rent (about 0.002 SOL) from the authority.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: fake USDC | A token from another mint, or from Token-2022, credited as USDC | A balance counts only if its mint is the configured USDC mint, its program is the Token program, and its owner is the deposit owner. A deposit account is created for the USDC mint and cannot hold another | `TestCredits` |
+| **S**poofing: someone else's account at our address | An attacker creates the account first, with themselves as owner | `createWithSeed` addresses can only be created with the base's (authority's) signature. Provisioning still checks an existing account's program, size, mint, owner, state, delegate and close authority, and refuses to activate a mismatch | `TestProvisionOnce` |
+| **T**ampering: rollback | A deposit's slot is dropped after it was credited | Only `finalized` commitment is read (slots, signatures, transactions, blocks) | — (property of the commitment level) |
+| **T**ampering: lying RPC | A forged transaction or token balance | The returned transaction's first signature must match the one asked for, its slot must be in range and it must have succeeded. Token balances are checked per entry (index in range and listed once, mint, owner, program, canonical amounts) | `TestCredits`, `FuzzCredits`, `FuzzParseAmount` |
+| **T**ampering: double credit | A re-scan, or one transaction touching two deposit accounts | Transfer identity is (signature, account index); the shared unique key, guarded update and ledger idempotency key apply | `TestDepositCreditedOnce` |
+| **T**ampering: amount overflow | A u64 balance increase above int64 | Refused, never truncated; the database also checks the range | `TestCredits`, `FuzzCredits` |
+| **D**enial of service: blocked address | A stranger sends SOL to a not-yet-created address, which makes `createAccountWithSeed` fail | A bare system account is topped up and allocated with `allocateWithSeed` | `TestProvisionPrefundedAddress` |
+| **D**enial of service: drained authority | Rent for many customers, or fees for failing retries, empties the authority | Only the operator can create customers; provisioning is at most 20 addresses per round, and an address that fails is retried, not re-funded | — |
+| **E**levation of privilege: authority key leak | The watcher host or its key file is compromised | The authority is not the token owner of any deposit account, so it cannot move USDC; the watcher refuses an owner equal to the authority. A leak exposes the authority's SOL and lets an attacker create accounts at Ferry's seeds, which provisioning detects as mismatches | `TestProvisionerRefusesAuthorityAsOwner` |
+| **E**levation of privilege: wrong authority | The API and the watcher are configured with different authorities | The watcher recomputes each address from its own key and refuses on mismatch, so it never creates an account nobody watches | — |
+
+### Residual risks
+
+- **The authority key is a file in dev.** It is read from `FERRY_SOLANA_AUTHORITY_KEYPAIR` (git-ignored `.dev/` locally). On devnet keep it outside the repo with tight permissions, and move it to KMS in M7.
+- **Squatting with a leaked authority.** Someone with the authority key could create an account at a future customer's address with themselves as owner. Provisioning would refuse to activate it, but the address would be lost and need an operator to re-derive it. KMS (M7) and keeping the key on the watcher host only limit this.
+- **One RPC call per deposit account per round.** `getSignaturesForAddress` pages back from the newest finalized signature each round. That is fine at portfolio scale; at volume, remember the last signature per account (`until`) or use a webhook or indexer.
+- **The validator container runs without seccomp.** Agave 3 needs `io_uring`, which Docker's default seccomp profile blocks. This applies only to the local and test validator, which binds to loopback; a custom profile that allows just `io_uring_*` would be tighter.
+- **Dust deposits are credited**, as on EVM.
