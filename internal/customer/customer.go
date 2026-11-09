@@ -39,10 +39,14 @@ type Customer struct {
 	CreatedAt time.Time
 }
 
-// Create adds a customer, opens their ledger accounts and issues an API
-// key, all in one transaction. The returned key is shown once; only its
-// hash is stored.
-func Create(ctx context.Context, pool *pgxpool.Pool, name string) (Customer, string, error) {
+// Hook runs inside the customer's creation transaction, e.g. to assign
+// deposit addresses. An error rolls the whole creation back.
+type Hook func(ctx context.Context, tx pgx.Tx, customerID uuid.UUID) error
+
+// Create adds a customer, opens their ledger accounts, issues an API key
+// and runs hooks, all in one transaction. The returned key is shown once;
+// only its hash is stored.
+func Create(ctx context.Context, pool *pgxpool.Pool, name string, hooks ...Hook) (Customer, string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 200 {
 		return Customer{}, "", ErrInvalidName
@@ -64,6 +68,11 @@ func Create(ctx context.Context, pool *pgxpool.Pool, name string) (Customer, str
 		c.Accounts = accts
 		if err := q.InsertAPIKey(ctx, customerdb.InsertAPIKeyParams{CustomerID: c.ID, KeyHash: HashKey(key)}); err != nil {
 			return fmt.Errorf("customer: insert api key: %w", err)
+		}
+		for _, h := range hooks {
+			if err := h(ctx, tx, c.ID); err != nil {
+				return err
+			}
 		}
 		row, err := q.GetCustomer(ctx, c.ID)
 		if err != nil {

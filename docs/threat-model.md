@@ -10,6 +10,7 @@ STRIDE analysis per component and trust boundary. Each component adds its sectio
 | TB2 | Operator / migrations → Postgres | SQL as the schema owner | M1 |
 | TB3 | Internet → API | HTTPS requests with a customer API key or the operator key | M2 |
 | TB4 | Ferry binaries ↔ queue | SQS messages (ElasticMQ locally) carrying outbox events | M3 |
+| TB5 | Chain RPC node → watcher | JSON-RPC responses: headers, block hashes, logs | M4 |
 
 Later milestones add the public API, inbound rail webhooks, chain RPC and the queue.
 
@@ -161,3 +162,35 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 - **No SLA alert yet.** A payout stuck in review for days is re-fetched but nobody is paged; the alert on `submitted` beyond SLA comes with metrics in M6.
 - **Resolver polls every stale `submitted` payout each round.** Fine at portfolio scale; at volume it needs backoff per payout (e.g. a `next_sync_at` column).
 - **Dev mode runs everything in the API process.** A crash of the API stops the worker too. Separate binaries are used once the rail is shared (M5).
+
+## Chain watchers (M4)
+
+**Assets:** customer balances (a deposit credit creates spendable money), the deposit address keys, and the scan cursor.
+
+**Assumptions:**
+
+- The RPC node (TB5) is a third party. It can be wrong, lagging, or serving a fork that later loses, and on testnet it may be malicious.
+- Anyone can send any token to a deposit address and emit any event from their own contract.
+- Ferry holds only the account xpub. The private key that can move funds out of deposit addresses lives outside Ferry, for the sweep, which is not built yet.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: fake USDC | A contract emitting the same `Transfer(address,address,uint256)` event | Only logs from the configured USDC contract address are accepted; the log's address is re-checked even though the filter asked for it | `TestRescanAndNoiseIgnored` |
+| **T**ampering: reorg | A deposit's block is replaced, and the transfer is double-spent elsewhere | Credit only after N confirmations; cursor-hash check, rewind and orphaning; nothing credited before confirmation | `TestReorgOrphansDeposit` |
+| **T**ampering: lagging or lying RPC | Logs served from a fork the node later drops | The deposit's block hash is re-checked right before crediting; on mismatch it is orphaned and re-scanned | `TestCreditVerifiesBlockHash` |
+| **T**ampering: double credit | A re-scan after a crash, a re-included transfer, or two watchers | Unique `(chain, tx_hash, log_index)`; the orphaned row is revived, not duplicated; confirm is a guarded `pending → confirmed` update with the ledger's idempotency key; one leader per chain | `TestRescanAndNoiseIgnored`, `TestReorgReincludedDepositCreditedOnce` |
+| **T**ampering: amount overflow | A uint256 amount above the int64 range wraps negative | `ParseAmount` refuses zero and anything above int64 (never truncates); the database also checks the range | `TestParseAmount`, `FuzzParseAmount` |
+| **R**epudiation | "My deposit never arrived" | Every detected transfer is stored with tx hash, log index and block; the status history shows pending → confirmed or orphaned | — |
+| **I**nformation disclosure | Linking customers through their addresses | Each customer has their own address. Addresses are public on-chain by nature, and the API shows them only to their owner | `TestDepositAddresses` |
+| **D**enial of service | Dust spam to deposit addresses, or a huge log range | Batches of at most 500 blocks; each dust transfer is one small row (credited as a real deposit) | — |
+| **E**levation of privilege: key exposure | The xpub leaks | An xpub reveals addresses (privacy), not funds. `NewDeriver` refuses private keys, so the API and watcher config cannot hold one | `TestDeriverRejectsBadKeys` |
+
+### Residual risks
+
+- **Deep reorgs are only logged.** A reorg deeper than the confirmation depth that removes a credited deposit needs a human `correction`, and there is no alert until M6. Keep confirmations conservative on testnet (12 by default).
+- **A single RPC provider.** The watcher trusts one node for liveness. Cross-checking several providers, or reconciliation against them (M6), would catch a node that consistently lies.
+- **The topic filter lists every deposit address.** That is fine at portfolio scale; at volume, filter only by contract and match locally, or use a log indexer.
+- **Dust deposits are credited.** Without a minimum deposit, spam creates rows and tiny credits; a minimum and a sweep threshold come with the sweep.
+- **Funds in deposit addresses are not swept yet.** They are recorded under `chain_omnibus`, but moving them needs the sweep (deferred).

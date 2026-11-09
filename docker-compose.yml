@@ -26,5 +26,14 @@ services:
     volumes:
       - ./deploy/elasticmq.conf:/opt/elasticmq.conf:ro
 
+  # Local EVM chain for deposits. Mines a block every 2 seconds so
+  # confirmations accrue on their own. State is in memory: restarting it
+  # resets the chain (run `make chain-setup` again).
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:v1.8.6
+    command: ["anvil --host 0.0.0.0 --chain-id 31337 --block-time 2"]
+    ports:
+      - "127.0.0.1:${ANVIL_PORT:-8545}:8545"
+
 volumes:
   pgdata:

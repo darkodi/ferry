@@ -70,3 +70,12 @@ sql:
         out: internal/outbox/outboxdb
         sql_package: pgx/v5
         overrides: *overrides
+  - engine: postgresql
+    schema: migrations
+    queries: internal/chain/queries.sql
+    gen:
+      go:
+        package: chaindb
+        out: internal/chain/chaindb
+        sql_package: pgx/v5
+        overrides: *overrides

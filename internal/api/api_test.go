@@ -22,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/darkodi/ferry/internal/api"
+	"github.com/darkodi/ferry/internal/chain"
+	"github.com/darkodi/ferry/internal/chain/evm"
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
@@ -78,12 +80,18 @@ func run(m *testing.M) int {
 	log := slog.New(slog.DiscardHandler)
 	idem = idempotency.NewStore(pool, time.Now, 30*time.Second, log)
 	payouts := payout.NewService(pool, rl, house, time.Now)
+	// Account m/44'/60'/1' of the public test mnemonic, as in .env.example.
+	deriver, err := evm.NewDeriver("evm-local", "xpub6Ce9NcJvTk372KjsGfWqbcex5DumjpNquQLApoeQUavSCjEc823BV1tb4rXUuPuht8h2hSxkg2EXUaKUJmniJvRZAELxypsCzBFdtosmV76")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	q := queue.NewMemory()
 	relay = outbox.NewRelay(pool, q, time.Now, log)
 	worker = payout.NewWorker(payouts, q, log)
 	srv = httptest.NewServer(api.New(api.Config{
 		Pool: pool, Payouts: payouts, Idem: idem,
-		House: house, AdminKey: adminKey, Dev: true, Log: log,
+		House: house, Addresses: chain.NewAddresses(deriver), AdminKey: adminKey, Dev: true, Log: log,
 	}))
 	defer srv.Close()
 	return m.Run()
@@ -355,4 +363,32 @@ func customerIDFromKey(key string) (uuid.UUID, error) {
 	err := pool.QueryRow(context.Background(),
 		`SELECT customer_id FROM api_keys WHERE key_hash = sha256($1::bytea)`, []byte(key)).Scan(&id)
 	return id, err
+}
+
+// A new customer gets an EVM deposit address; deposits start empty; another
+// customer's id answers 404 like an unknown one.
+func TestDepositAddresses(t *testing.T) {
+	id, key := newCustomer(t, "")
+	_, other := newCustomer(t, "")
+
+	r := call(t, "GET", "/v1/customers/"+id+"/deposit-addresses", key, "", nil)
+	wantStatus(t, r, http.StatusOK)
+	addrs := r.json(t)["deposit_addresses"].([]any)
+	if len(addrs) != 1 {
+		t.Fatalf("deposit addresses %v, want one", addrs)
+	}
+	a := addrs[0].(map[string]any)
+	if a["chain"] != "evm-local" || a["status"] != "active" || len(a["address"].(string)) != 42 {
+		t.Fatalf("address %v", a)
+	}
+
+	r = call(t, "GET", "/v1/customers/"+id+"/deposits", key, "", nil)
+	wantStatus(t, r, http.StatusOK)
+	if ds := r.json(t)["deposits"].([]any); len(ds) != 0 {
+		t.Fatalf("deposits %v, want none", ds)
+	}
+
+	for _, path := range []string{"/deposit-addresses", "/deposits"} {
+		wantStatus(t, call(t, "GET", "/v1/customers/"+id+path, other, "", nil), http.StatusNotFound)
+	}
 }

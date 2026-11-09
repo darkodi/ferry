@@ -233,7 +233,9 @@ If entry 3 were skipped, `noah_prefunded` would go to −49.80 at settlement. Ho
 | --- | --- |
 | `customers` | A business using Ferry: id, name. Its ledger accounts are opened in the same transaction |
 | `api_keys` | SHA-256 of each customer API key (keys are random 32 bytes, shown once), revoked\_at |
-| `deposits` | Detected on-chain transfers: chain, tx\_hash, log\_index, amount, confirmations, status |
+| `deposit_addresses` | One address per customer and chain, derived from public key material; status `active` or `provisioning` |
+| `deposits` | Detected on-chain transfers: chain, tx\_hash, log\_index, block number and hash, amount, status (`pending`, `confirmed`, `orphaned`) |
+| `chain_cursors`, `chain_blocks` | Per chain: how far the watcher has scanned, and the hashes of recent blocks for finding a reorg's fork point |
 | `quotes` | Rail price for a payout: fiat amount, authorized crypto amount, fee, expires\_at |
 | `payouts` | The payout state machine: status, version, needs\_resolution, and the client's idempotency key (unique per customer) |
 | `rail_transactions` | One row per rail attempt: nonce, external\_id (= payout id), rail\_tx\_id, status, sub\_status, rfi\_status, last\_event\_version |
@@ -272,8 +274,10 @@ Each step below is one database transaction that changes state, writes ledger po
 
 1. Chain watcher sees a USDC `Transfer` (EVM) or token transfer (Solana) to a customer's deposit address.
 2. Insert `deposits` row keyed by `(chain, tx_hash, log_index)` with status `pending`. Duplicate detection is the unique key.
-3. When confirmations reach the chain's threshold, mark `confirmed` and post a `deposit` entry. Emit `deposit.confirmed`.
+3. When confirmations reach the chain's threshold, check that the deposit's block hash is still the one on the chain, then mark `confirmed` and post a `deposit` entry and the `deposit.confirmed` event in one transaction. If the hash changed, orphan the deposit and rescan from just before its block.
 4. If the block is reorged out before confirmation, mark `orphaned`; nothing was posted, so nothing to reverse.
+5. If the same transfer is included again in a new block (nodes return the transactions of dropped blocks to their mempool), the orphaned row goes back to `pending` at its new block. It is still one deposit, credited at most once.
+6. A *confirmed* deposit above a fork point (a reorg deeper than the confirmation depth) is never undone automatically: the watcher logs it, and a human posts a `correction`.
 
 ### Payout (USDC out to fiat)
 
@@ -359,25 +363,34 @@ Exactly-once *delivery* is impossible; Ferry gets exactly-once *effects* from th
 
 ## Blockchain integration
 
-One `ChainAdapter` interface hides chain differences; the rest of Ferry sees only confirmed deposits and signed transfers.
+One adapter interface hides chain differences; the rest of Ferry sees only confirmed deposits. M4 builds the read side (`internal/chain.Adapter`); the outbound methods arrive with the treasury sweep.
 
 ```go
-type ChainAdapter interface {
+type Adapter interface {
     Chain() string
     Head(ctx context.Context) (Block, error)
-    ScanTransfers(ctx context.Context, from, to uint64) ([]Transfer, error)
     BlockHash(ctx context.Context, n uint64) (string, error)
-    SendUSDC(ctx context.Context, req SendRequest) (TxRef, error)
-    TxStatus(ctx context.Context, ref TxRef) (TxStatus, error)
+    ScanTransfers(ctx context.Context, from, to uint64, watched map[string]uuid.UUID) ([]Transfer, error)
+    // later, with the sweep:
+    // SendUSDC(ctx context.Context, req SendRequest) (TxRef, error)
+    // TxStatus(ctx context.Context, ref TxRef) (TxStatus, error)
 }
 ```
+
+`chain.Watcher` is the chain-agnostic engine around an adapter. Each round it does three things:
+
+1. **Reorg check.** It compares the stored hash of the cursor block with the chain's.
+2. **Scan.** It reads the next block range and stores pending deposits and the new cursor in one transaction.
+3. **Confirm.** It verifies each deposit's block hash, then credits it.
+
+A Postgres advisory lock keeps one active watcher per chain; a second copy stands by.
 
 | Concern | EVM testnet (e.g. Sepolia / Base Sepolia) | Solana devnet |
 | --- | --- | --- |
 | Detect deposits | `eth_getLogs` for USDC `Transfer` to known addresses, in block ranges | `getSignaturesForAddress` on each deposit token account, then `getTransaction` |
 | Finality | N confirmations (configurable) or the `finalized` tag | `finalized` commitment |
-| Reorg handling | Store hash of each scanned block; on parent-hash mismatch, rewind to last matching block and re-scan | Use only `finalized`; reorg risk handled by commitment level |
-| Deposit addresses | One address per customer from an HD key (BIP-44) | One associated token account per customer |
+| Reorg handling | Store the hash of each scanned range's last block and of every deposit's block; when the cursor block's hash changes, rewind to the newest stored block still on the chain, orphan pending deposits above it and re-scan. Before crediting, re-check the deposit's block hash | Use only `finalized`; reorg risk handled by commitment level |
+| Deposit addresses | BIP-32 from an account xpub (`m/44'/60'/0'`): customer *i* gets `xpub/0/i`. Ferry holds only the xpub, so it can compute every address but spend from none | A token account per customer at a seed-derived address (`createWithSeed` from Ferry's authority key), created on-chain by the watcher before it is `active` |
 | Outbound (treasury sweep) | Nonce manager: reserve nonce in Postgres, sign, store raw tx before broadcast, rebroadcast same raw tx | Recent blockhash + durable record of signature before send; re-check status before re-sending |
 
 Design notes:
@@ -385,7 +398,9 @@ Design notes:
 - **Cursor per chain.** `chain_cursors(chain, last_scanned_block, last_block_hash)` updated in the same tx as inserted deposits, so a crash re-scans and dedups on the unique key.
 - **Stuck transactions.** EVM: after a timeout, replace with same nonce and higher fee; record both hashes, settle on whichever lands.
 - **Keys.** Local dev keys in env vars; on AWS, KMS for signing (EVM `secp256k1` keys are supported). Never in the database.
-- **Scope cut.** Payouts in this project go to fiat via the rail, so on-chain outbound is limited to a treasury sweep from deposit addresses to an omnibus wallet.
+- **Scope cut.** Payouts in this project go to fiat via the rail, so on-chain outbound is limited to a treasury sweep from deposit addresses to an omnibus wallet. The sweep is deferred past M4: it needs signing keys, gas top-ups for EVM deposit addresses and a nonce manager, and changes no ledger rule (`chain_omnibus` already covers USDC in deposit addresses).
+- **Untrusted RPC.** Every log is re-checked: the contract address, the event signature, the recipient, the block range, `removed`, and an amount that fits int64 minor units. Amounts above it are refused, never truncated.
+- **Local chain.** Anvil (docker compose) with `contracts/TestUSDC.sol`, a 6-decimal test token; tests use go-ethereum's in-process simulated backend, whose `Fork` makes real reorgs.
 
 ## Rail integration (Noah)
 
@@ -505,7 +520,8 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 | --- | --- | --- |
 | POST | `/v1/customers` | Operator only (admin key). Create customer + accounts; returns the API key once |
 | GET | `/v1/customers/{id}/balances` | Available and held per currency |
-| GET | `/v1/customers/{id}/deposit-addresses` | Per-chain addresses |
+| GET | `/v1/customers/{id}/deposit-addresses` | Per-chain addresses and their status |
+| GET | `/v1/customers/{id}/deposits` | Detected deposits: pending, confirmed or orphaned |
 | POST | `/v1/payouts` | Create + quote; requires `Idempotency-Key` |
 | POST | `/v1/payouts/{id}/confirm` | Places hold, enqueues submit |
 | GET | `/v1/payouts/{id}` | State, quote, timeline of transitions |
@@ -550,7 +566,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 
 ### Open questions
 
-- Which EVM testnet has a usable USDC faucet (Sepolia vs Base Sepolia)?
+- ~~Which EVM testnet has a usable USDC faucet?~~ Decided in M4: the chain is configuration (`FERRY_EVM_CHAIN`, RPC URL, USDC address). Both Ethereum Sepolia and Base Sepolia have Circle's test USDC; docs use Sepolia.
 - Does the Noah sandbox send webhooks to a public URL, or is polling needed locally (use a tunnel such as ngrok)?
 - ~~SQS vs NATS for the local default~~ Decided in M3: SQS everywhere, with ElasticMQ standing in locally, so there is one queue adapter and the DLQ behaves the same in dev and on AWS.
 - **Treasury top-up:** when and how USDC moves from the omnibus wallet to Noah (the `treasury_topup` entry); manual in v1 until M4.

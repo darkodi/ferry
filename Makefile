@@ -26,7 +26,7 @@ SQLC_VERSION          := v1.31.1
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: help up down migrate migrate-status run relay test lint vet vuln gitleaks sqlc tools
+.PHONY: help up down migrate migrate-status run relay watcher contracts chain-setup test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -48,6 +48,25 @@ run: ## Run the API (in dev also the relay, worker and resolver; needs `make up`
 
 relay: ## Run the outbox relay (needs `make up` for the queue)
 	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/relay
+
+watcher: ## Run the EVM deposit watcher (needs `make up` and `make chain-setup`)
+	DATABASE_URL="$(DATABASE_URL)" FERRY_CHAIN=evm go run ./cmd/watcher
+
+# Anvil's first default account. Anvil keeps its keys unlocked, so no
+# private key is needed (or stored) to deploy or send from it.
+ANVIL_ACCOUNT := 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+SOLC_IMAGE    := ethereum/solc:0.8.30
+ANVIL_CAST    := docker compose exec -T anvil cast send --rpc-url http://localhost:8545 --unlocked --from $(ANVIL_ACCOUNT)
+
+contracts: ## Recompile contracts/ with the pinned solc image
+	docker run --rm -v "$(CURDIR)/contracts:/src" -u "$$(id -u):$$(id -g)" $(SOLC_IMAGE) \
+		--optimize --bin --abi --overwrite -o /src/build /src/TestUSDC.sol
+
+chain-setup: ## Deploy TestUSDC to local Anvil and mint 1,000,000 to the first account
+	@addr=$$($(ANVIL_CAST) --json --create $$(cat contracts/build/TestUSDC.bin) \
+		| tr ',' '\n' | grep '"contractAddress"' | cut -d'"' -f4); \
+	$(ANVIL_CAST) $$addr "mint(address,uint256)" $(ANVIL_ACCOUNT) 1000000000000 >/dev/null; \
+	echo "TestUSDC deployed at $$addr (FERRY_EVM_USDC_ADDRESS)"
 
 test: ## Unit + integration tests with the race detector
 	go test -race -count=1 ./...
