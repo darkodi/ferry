@@ -143,7 +143,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/transactions/sell", s.auth(s.sell))
 	mux.HandleFunc("GET /v1/transactions/{id}", s.auth(s.get))
 	mux.HandleFunc("GET /v1/transactions", s.auth(s.list))
+	mux.HandleFunc("GET /v1/balances", s.auth(s.balances))
 	mux.HandleFunc("POST /_control/transactions/{id}/{action}", s.control)
+	mux.HandleFunc("POST /_control/credit/{amount}", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := ledger.ParseUSDC(r.PathValue("amount")); err != nil {
+			writeErr(w, http.StatusBadRequest, "InvalidMessage", "amount must be a USDC decimal")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"ID": s.Credit(r.PathValue("amount"))})
+	})
 	mux.HandleFunc("GET /_control/transactions", func(w http.ResponseWriter, _ *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -327,6 +335,55 @@ func (s *Server) Reverse(id, amountStr string) (string, error) {
 	s.order = append(s.order, t.ID)
 	s.emit(t)
 	return t.ID, nil
+}
+
+// Credit records USDC arriving in Ferry's Noah account from outside, as
+// a treasury top-up does: an incoming, settled transaction with no
+// Reverses. It returns the transaction id.
+func (s *Server) Credit(amountStr string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := &noah.Transaction{
+		ID: uuid.NewString(), Created: s.now().UTC().Truncate(time.Second), Status: "Settled",
+		Direction: "In", CryptoCurrency: Crypto, Amount: amountStr,
+	}
+	s.txs[t.ID] = t
+	s.order = append(s.order, t.ID)
+	s.emit(t)
+	return t.ID
+}
+
+// balances answers GET /balances: incoming settled credits minus settled
+// sales. Total includes pending outflows (they are not subtracted until
+// they settle); Available subtracts them.
+func (s *Server) balances(w http.ResponseWriter, _ *http.Request, _ []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total, pending ledger.Amount
+	for _, id := range s.order {
+		t := s.txs[id]
+		a, _ := ledger.ParseUSDC(t.Amount)
+		switch {
+		case t.Status == "Settled" && t.Direction == "In":
+			total += a
+		case t.Status == "Settled" && t.Direction == "Out":
+			total -= a
+		case t.Status == "Pending" && t.Direction == "Out":
+			pending += s.sessionOf(t).needed + s.sessionOf(t).fee
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"Items": []map[string]string{{
+		"AccountType": "Current", "CryptoCurrency": Crypto, "Total": signedAmount(total), "Available": signedAmount(total - pending),
+	}}})
+}
+
+// signedAmount formats a balance that may be negative (Noah's never is;
+// the fake's can be when tests skip the top-up).
+func signedAmount(a ledger.Amount) string {
+	if a < 0 {
+		return "-" + amount(-a)
+	}
+	return amount(a)
 }
 
 // Transactions returns every transaction, oldest first.
@@ -669,21 +726,23 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, _ []byte) {
 	if n, err := strconv.Atoi(q.Get("PageSize")); err == nil && n >= 1 && n <= 100 {
 		size = n
 	}
-	from := time.Time{}
-	if v := q.Get("CreatedFrom"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			writeErr(w, http.StatusBadRequest, "InvalidMessage", "CreatedFrom")
-			return
+	from, to := time.Time{}, time.Time{}
+	for name, dst := range map[string]*time.Time{"CreatedFrom": &from, "CreatedTo": &to} {
+		if v := q.Get(name); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, "InvalidMessage", name)
+				return
+			}
+			*dst = t
 		}
-		from = t
 	}
 	start, _ := strconv.Atoi(q.Get("PageToken"))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var all []*noah.Transaction
 	for i := len(s.order) - 1; i >= 0; i-- { // DESC by default
-		if t := s.txs[s.order[i]]; !t.Created.Before(from) {
+		if t := s.txs[s.order[i]]; !t.Created.Before(from) && (to.IsZero() || !t.Created.After(to)) {
 			all = append(all, t)
 		}
 	}

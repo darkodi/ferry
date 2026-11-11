@@ -27,6 +27,7 @@ import (
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
 	"github.com/darkodi/ferry/internal/rail"
+	"github.com/darkodi/ferry/internal/treasury"
 )
 
 // Config wires the API to its dependencies.
@@ -48,7 +49,10 @@ type Config struct {
 	// RailWebhooks verifies the payout rail's webhooks; nil serves no
 	// webhook route (the mock rail sends none).
 	RailWebhooks RailWebhooks
-	Log          *slog.Logger
+	// Treasury books treasury top-ups; nil serves no top-up route (the
+	// mock rail has no balance to top up).
+	Treasury *treasury.Service
+	Log      *slog.Logger
 }
 
 type server struct {
@@ -79,6 +83,11 @@ func New(cfg Config) http.Handler {
 		r.Group(func(r chi.Router) { // operator
 			r.Use(s.requireAdmin)
 			r.Post("/customers", s.createCustomer)
+			r.Get("/admin/recon-breaks", s.listBreaks)
+			r.Post("/admin/recon-breaks/{id}/resolve", s.resolveBreak)
+			if cfg.Treasury != nil {
+				r.Post("/admin/treasury-topups", s.recordTopup)
+			}
 			if cfg.Dev {
 				r.Post("/dev/deposits", s.devDeposit)
 			}

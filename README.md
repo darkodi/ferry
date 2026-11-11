@@ -14,7 +14,8 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | M3 — Events (outbox relay, workers, resolver) | done |
 | M4 — Chains (EVM and Solana deposits) | done |
 | M5 — Noah rail (destinations, signed adapter, webhooks, returns; sandbox run pending a key) | done |
-| M6–M7 | planned |
+| M6 — Recon + ops (reconciliation and treasury top-ups; metrics and traces next) | in progress |
+| M7 | planned |
 
 What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Customers get their own EVM deposit address, derived from an xpub so Ferry never holds the key. `cmd/watcher` reads USDC transfers to those addresses, shows them as pending, and credits them after N confirmations. It handles reorgs by rewinding and orphaning, and re-checks every block hash before crediting. On Solana, each customer gets a token account at a seed-derived address. The watcher creates it on-chain (signing with a key that can create accounts but cannot move funds), reads only finalized slots, and credits a deposit as soon as it sees it. The treasury sweep out of deposit addresses comes later.
 
@@ -104,6 +105,8 @@ curl -s $B/customers/$CID/balances -H "Authorization: Bearer $KEY"
 ```
 
 Sending step 3 again with the same `Idempotency-Key` returns the same payout with `Idempotent-Replayed: true`.
+
+**Reconciliation.** `make recon` runs `cmd/recon` once. It checks the ledger's invariants, every configured chain's deposit addresses, and (with `FERRY_RAIL=noah`) Noah's transactions and balance, and records anything that disagrees as a break. List breaks with `GET /v1/admin/recon-breaks` (operator key); explain one with `POST /v1/admin/recon-breaks/{id}/resolve`. With Noah, book money that arrives in Ferry's Noah balance with `POST /v1/admin/treasury-topups {"rail_tx_id": "..."}`: Ferry reads the amount from Noah. With the fake, `curl -X POST localhost:18090/_control/credit/1000` simulates a top-up arriving.
 
 If port 5432 is taken on your machine, set `POSTGRES_PORT` and the port in `DATABASE_URL` in `.env` to a free one.
 

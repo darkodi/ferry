@@ -514,6 +514,41 @@ Process:
 4. Metric `recon_breaks_open` and an alert when any break is older than 24 hours.
 5. Resolution is a human action that posts a `correction` entry whose `ref_id` is the break; the reason is stored on the break.
 
+### As built (M6)
+
+`cmd/recon` runs once per invocation (cron; an ECS scheduled task in M7), or in a loop with `-every`. It reads only:
+- chain RPC;
+- the rail's read endpoints;
+- the database.
+
+It holds no private key and no data key, and a Postgres advisory lock keeps runs from overlapping.
+
+**Checkers** (`internal/recon`). Each one runs only if its source is configured:
+
+| Checker | Compares | Break kinds |
+| --- | --- | --- |
+| `internal` | `ledger.CheckInvariants` and `payout.CheckInvariants` | the invariant's name, e.g. `held_mismatch`, `house_negative` |
+| `chain` (one per chain) | Each deposit address's on-chain USDC against the deposits Ferry recorded there (pending and confirmed). EVM reads `balanceOf` at min(watcher cursor, head − confirmations) and counts deposits up to that block. Solana reads the token account at finalized. Also, each chain's confirmed deposits against its deposit entries in the ledger | `address_balance`, `ledger_deposits` |
+| `rail` (Noah) | Every Noah transaction created in the window: a sale must belong to a payout (by Noah id, then `ExternalID`) in an agreeing state, and a settled one must be booked for exactly its amount; a return must be booked for exactly its amount; any other credit must be booked as a top-up. Every Ferry rail attempt in the window must exist at Noah (looked up by id before calling it missing). Noah's balance `Total` must equal `noah_prefunded` | `unknown_rail_tx`, `status_mismatch`, `settle_amount`, `return_not_booked`, `topup_not_booked`, `missing_at_rail`, `balance` |
+
+The rail window defaults to the last 48 hours, minus the newest 10 minutes (`-window`, `-settle`), so in-flight transactions don't raise breaks. The balance check is point-in-time and catches an unbooked credit at once.
+
+**The break lifecycle.** A break is keyed by (check, kind, subject); the subject starts with the checker's scope, e.g. `evm-local:` or `noah:`.
+- Each run upserts its breaks, so a lasting disagreement is one row with a growing `seen_count`.
+- A break that a later *completed* run of its checker no longer sees is **cleared**. A checker that couldn't run (its source was down) clears nothing.
+- A person **resolves** a break with a reason (`POST /v1/admin/recon-breaks/{id}/resolve`). It stays resolved while later runs see the same detail and reopens if the detail changes. Break details therefore hold only values, never timestamps or block numbers.
+- Point-in-time checks clear themselves (a deposit on-chain but not yet scanned, a sale settled at Noah moments before its webhook), so alerts look only at breaks that persist.
+
+Reconciliation **never changes the ledger or a payout**. A ledger fix is a separate `correction` entry whose reference names the break.
+
+**Treasury top-ups.** `noah_prefunded` only goes down as payouts settle; a top-up brings it back up. `POST /v1/admin/treasury-topups {rail_tx_id}` (operator only):
+- fetches the transaction from Noah and requires it to be incoming, settled, in the configured USDC, and not a return;
+- posts `treasury_topup` for exactly Noah's amount, keyed `topup:noah:<id>`, so booking it again is a no-op.
+
+The operator never supplies an amount.
+
+**A modelling note.** v1's `treasury_topup` moves USDC from `chain_omnibus` to `noah_prefunded`, which assumes Noah is funded from the on-chain omnibus wallet. Money that reaches Noah from elsewhere (sandbox credits, or Ferry's own capital) makes `chain_omnibus` negative. The internal checker reports that as `house_negative`. That's a true statement about the model, and an owner-capital account is the fix if Ferry ever funds Noah from its own money.
+
 ## Failure modes and mitigations
 
 This table is the section an interviewer will probe; each row should have a test that reproduces it.
@@ -596,6 +631,9 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 | POST | `/v1/payouts/{id}/confirm` | Places hold, enqueues submit |
 | GET | `/v1/payouts/{id}` | State, quote, timeline of transitions |
 | GET | `/v1/ledger/entries?account_id=` | Paginated postings (cursor-based) |
+| POST | `/v1/admin/treasury-topups` | Operator only. Book a top-up from the rail transaction id; the amount comes from the rail |
+| GET | `/v1/admin/recon-breaks` | Operator only. Live reconciliation breaks (`?resolved=true` includes resolved ones) |
+| POST | `/v1/admin/recon-breaks/{id}/resolve` | Operator only. Record why a break is acceptable; moves no money |
 | POST | `/v1/webhooks/{rail}` | Inbound rail events (`noah`): signature-verified, stored, then a re-fetch is queued |
 
 Publish it as an OpenAPI spec; generate the server stubs with `oapi-codegen`.
@@ -631,7 +669,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
 4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test. *(done; the treasury sweep is deferred, see Blockchain integration)*
 5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox. *(done: destinations, signed adapter, standalone worker, verified webhooks and returns; the real sandbox is still to be run once a key exists)*
-6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard.
+6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard. *(PR 1: reconciliation, treasury top-ups; PR 2: metrics, traces, alerts, dashboard)*
 7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video.
 
 ### Open questions

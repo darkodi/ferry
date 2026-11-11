@@ -26,7 +26,7 @@ SQLC_VERSION          := v1.31.1
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: help up down migrate migrate-status run relay worker fake-noah watcher watcher-solana contracts chain-setup evm-setup solana-setup test lint vet vuln gitleaks sqlc tools
+.PHONY: help up down migrate migrate-status run relay worker recon fake-noah watcher watcher-solana contracts chain-setup evm-setup solana-setup test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -52,6 +52,9 @@ relay: ## Run the outbox relay (needs `make up` for the queue)
 
 worker: ## Run the payout worker and resolver (FERRY_RAIL=noah; needs `make up`)
 	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/worker
+
+recon: ## Run reconciliation once (chains and rail as configured in .env)
+	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/recon
 
 fake-noah: ## Run a fake Noah API on 127.0.0.1:18090 for local payouts without a sandbox key
 	go run ./internal/rail/noah/noahtest/cmd/fakenoah

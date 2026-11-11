@@ -305,3 +305,36 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 - **A large reversal amount stops for a human.** Noah reports a reversal at the market rate, which may exceed what was spent; Ferry then logs `ErrRailMismatch` and leaves the payout `settled`. The alert arrives with M6.
 - **The step after a reversal is unverified.** For pre-funded payouts, it's not yet known whether Noah's follow-up on-chain `AdjustmentFor` transaction ever moves Ferry's balance. Until the sandbox shows it, such transactions are stored, not applied.
 - **Return lookup is bounded** to 10 pages of transactions after the sale. A return Noah books much later and buried under heavy traffic would be missed until reconciliation (M6).
+
+## Reconciliation and treasury (M6)
+
+`cmd/recon` reads Postgres, chain RPC (TB5) and Noah's read endpoints (TB7). The admin API gains top-up booking and break resolution behind the operator key (TB3).
+
+**Assets:**
+- the truth of the ledger, and the early warning reconciliation gives when it drifts;
+- `noah_prefunded`, which top-ups increase.
+
+**Assumptions:**
+- Chain RPC and Noah can be wrong or briefly behind.
+- The operator key holder is trusted to explain breaks, but not to type amounts into the ledger.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: top-up for money that never arrived | An operator (or stolen admin key) books a large "top-up" | The endpoint takes only a rail transaction id; Ferry fetches it from Noah and books Noah's amount, and only for an incoming, settled credit in the right currency that is not a return. An `amount` field is rejected | `TestAdminTreasuryTopup`, `TestTreasuryRefusesNonTopups` |
+| **T**ampering: double-booked top-up | The same credit booked twice | Ledger idempotency key `topup:noah:<id>`; the second call reports `new: false` | `TestRailCheck`, `TestAdminTreasuryTopup` |
+| **T**ampering: hiding a discrepancy | Resolving a break to silence it | A reason is required and stored; a resolved break reopens when its detail changes; resolving moves no money | `TestBreakLifecycle`, `TestAdminReconBreaks` |
+| **T**ampering: one check clearing another's breaks | A Solana outage clears EVM breaks, or the reverse | Breaks are scoped by subject prefix; only a completed checker clears, and only within its scope | `TestFailedCheckKeepsItsBreaks`, `TestBreakOutsideScopeRefused` |
+| **R**epudiation | "We never knew Noah held more than the ledger" | Every run is stored (`recon_runs`), and every break keeps `first_seen`, `seen_count` and its detail | `TestBreakLifecycle` |
+| **I**nformation disclosure | Recon or its logs leak secrets | Recon has no private key and no data key; break details hold amounts, statuses and ids, never bank details | — |
+| **D**enial of service: noisy breaks | Point-in-time races flood the break list | Breaks clear themselves when a later run agrees; the rail window leaves out the newest 10 minutes | `TestBreakLifecycle` |
+| **E**levation of privilege | Recon writes to the ledger | Recon's writes go only to `recon_*` tables (append-only except lifecycle columns); top-ups go through the ledger's own posting path | — (grants in `00011_recon.sql`) |
+
+### Residual risks
+
+- **No alerting yet.** Breaks are visible in the admin API and logs; the alert for breaks older than 24 hours arrives with metrics (M6 PR 2).
+- **Chain checks scale with addresses.** One `balanceOf` (or token-balance) call per deposit address per run is fine at portfolio scale; at volume, use Multicall or an indexer.
+- **Solana is read "now".** A deposit finalized but not yet scanned shows as an `address_balance` break that the next run clears.
+- **Deposits before the watcher started** sit on-chain without a deposit row, so they remain `address_balance` breaks until a person resolves or corrects them. That's by design: Ferry never credits money it did not see arrive.
+

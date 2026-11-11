@@ -118,6 +118,31 @@ type Event struct {
 	Payload  []byte // the verified body, kept for audit
 }
 
+// Record is any transaction on the rail account, as reconciliation sees
+// it: sales (payouts), returns and incoming credits (treasury top-ups).
+type Record struct {
+	ID         string
+	ExternalID string
+	Direction  string // "In" or "Out"
+	Status     Status
+	Reverses   string // set on a return: the original sale's id
+	Amount     ledger.Amount
+	Currency   string
+	Created    time.Time
+}
+
+// Reconcilable is a rail whose records reconciliation and treasury
+// bookkeeping can read. Read-only: none of these move money.
+type Reconcilable interface {
+	// Records lists transactions created in [from, to).
+	Records(ctx context.Context, from, to time.Time) ([]Record, error)
+	// Record fetches one transaction; found is false if the rail has none.
+	Record(ctx context.Context, id string) (r Record, found bool, err error)
+	// Balance is Ferry's balance at the rail including outflows that have
+	// not settled yet, comparable to the ledger's prefunded account.
+	Balance(ctx context.Context) (ledger.Amount, error)
+}
+
 // Errors.
 var (
 	// ErrRejected: the rail refused the request and created nothing.
