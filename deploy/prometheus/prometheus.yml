@@ -1,0 +1,23 @@
+# Local Prometheus for Ferry (docker compose, profile "observability").
+# It runs with host networking and scrapes each binary's loopback metrics
+# port; on AWS (M7) the same jobs point at the tasks' private addresses.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: ferry
+    static_configs:
+      - targets: ["127.0.0.1:9101"]
+        labels: { service: api }
+      - targets: ["127.0.0.1:9102"]
+        labels: { service: relay }
+      - targets: ["127.0.0.1:9103"]
+        labels: { service: worker }
+      - targets: ["127.0.0.1:9104"]
+        labels: { service: watcher-evm }
+      - targets: ["127.0.0.1:9105"]
+        labels: { service: watcher-solana }

@@ -1,6 +1,10 @@
 package noah
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/darkodi/ferry/internal/platform/obs"
 )
 
 // maxResponse bounds how much of a Noah response is read.
@@ -86,7 +92,20 @@ func isLoopback(host string) bool {
 // do sends one request and decodes a 2xx JSON answer into out. Any other
 // status comes back as *APIError. Unknown response fields are ignored:
 // Noah adds fields over time, and Ferry checks the ones it uses.
-func (c *Client) do(ctx context.Context, method, path string, query url.Values, in, out any) error {
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, in, out any) (err error) {
+	// One span per call: method, path and status only. Bodies (bank
+	// details) and headers (the API key) never go into traces.
+	ctx, span := obs.Tracer.Start(ctx, "noah "+method+" "+path, trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("http.method", method), attribute.String("url.path", path)))
+	defer func() {
+		if err != nil {
+			span.SetStatus(codes.Error, "noah call failed")
+			if st := statusOf(err); st != 0 {
+				span.SetAttributes(attribute.Int("http.status_code", st))
+			}
+		}
+		span.End()
+	}()
 	var body []byte
 	if in != nil {
 		var err error
@@ -117,6 +136,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	}
 
 	resp, err := c.http.Do(req)
+	if err == nil {
+		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+	}
 	if err != nil {
 		return fmt.Errorf("noah: %s %s: %w", method, path, err)
 	}

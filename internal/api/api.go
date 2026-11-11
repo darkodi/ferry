@@ -4,6 +4,8 @@
 package api
 
 import (
+	"strconv"
+
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -14,6 +16,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -26,6 +31,7 @@ import (
 	"github.com/darkodi/ferry/internal/idempotency"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/rail"
 	"github.com/darkodi/ferry/internal/treasury"
 )
@@ -156,11 +162,28 @@ func (s *server) requireAdmin(next http.Handler) http.Handler {
 
 // ---- logging ----
 
+// logRequests traces, measures and logs every request. Each request starts
+// a new trace: a client's traceparent is ignored, because with parent-based
+// sampling a caller could otherwise mark its own requests "not sampled"
+// and keep them out of traces. Metrics use the route pattern
+// (/v1/payouts/{id}), never the raw path, so ids do not become labels.
 func (s *server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		ctx, span := obs.Tracer.Start(r.Context(), "HTTP "+r.Method,
+			trace.WithSpanKind(trace.SpanKindServer), trace.WithNewRoot())
+		defer span.End()
+		r = r.WithContext(ctx)
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
+		route := "unmatched"
+		if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+			route = rc.RoutePattern()
+		}
+		span.SetName("HTTP " + r.Method + " " + route)
+		span.SetAttributes(attribute.String("http.route", route), attribute.Int("http.status_code", ww.Status()))
+		obs.HTTPRequests.WithLabelValues(r.Method, route, strconv.Itoa(ww.Status())).Inc()
+		obs.HTTPDuration.WithLabelValues(r.Method, route).Observe(time.Since(start).Seconds())
 		s.Log.InfoContext(r.Context(), "request",
 			"method", r.Method, "path", r.URL.Path, "status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),

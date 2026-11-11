@@ -58,16 +58,20 @@ func TestSQS(t *testing.T) {
 			t.Fatal(err)
 		}
 		q.Wait = 1
-		want := Message{ID: "42", Topic: "payout.held", Body: []byte(`{"payout_id":"x"}`)}
+		want := Message{ID: "42", Topic: "payout.held", Body: []byte(`{"payout_id":"x"}`),
+			TraceParent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
 		if err := q.Publish(ctx, want); err != nil {
 			t.Fatal(err)
+		}
+		if n, err := q.Depth(ctx, ""); err != nil || n != 1 {
+			t.Fatalf("depth %d, %v; want 1", n, err)
 		}
 		got, err := q.Receive(ctx, 10)
 		if err != nil || len(got) != 1 {
 			t.Fatalf("receive: %v, %d messages", err, len(got))
 		}
 		d := got[0]
-		if d.ID != want.ID || d.Topic != want.Topic || string(d.Body) != string(want.Body) || d.Receives != 1 {
+		if d.ID != want.ID || d.Topic != want.Topic || string(d.Body) != string(want.Body) || d.Receives != 1 || d.TraceParent != want.TraceParent {
 			t.Fatalf("got %+v, want %+v with 1 receive", d, want)
 		}
 		if err := q.Ack(ctx, d); err != nil {

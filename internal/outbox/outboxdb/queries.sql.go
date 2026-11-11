@@ -23,7 +23,7 @@ WHERE id IN (
     LIMIT $3
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, topic, aggregate_id, payload
+RETURNING id, topic, aggregate_id, payload, traceparent
 `
 
 type ClaimParams struct {
@@ -37,6 +37,7 @@ type ClaimRow struct {
 	Topic       string
 	AggregateID uuid.UUID
 	Payload     []byte
+	Traceparent *string
 }
 
 // Leases up to @max_rows unpublished rows that no other relay holds.
@@ -55,6 +56,7 @@ func (q *Queries) Claim(ctx context.Context, arg ClaimParams) ([]ClaimRow, error
 			&i.Topic,
 			&i.AggregateID,
 			&i.Payload,
+			&i.Traceparent,
 		); err != nil {
 			return nil, err
 		}

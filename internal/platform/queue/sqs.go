@@ -17,6 +17,7 @@ import (
 const (
 	attrTopic = "topic"
 	attrID    = "message_id"
+	attrTrace = "traceparent"
 )
 
 // SQS is a queue backed by Amazon SQS, or by ElasticMQ locally (same API).
@@ -49,13 +50,17 @@ func NewSQS(ctx context.Context, endpoint, queueURL string) (*SQS, error) {
 
 // Publish sends m.
 func (q *SQS) Publish(ctx context.Context, m Message) error {
+	attrs := map[string]types.MessageAttributeValue{
+		attrTopic: {DataType: aws.String("String"), StringValue: aws.String(m.Topic)},
+		attrID:    {DataType: aws.String("String"), StringValue: aws.String(m.ID)},
+	}
+	if m.TraceParent != "" {
+		attrs[attrTrace] = types.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(m.TraceParent)}
+	}
 	_, err := q.client.SendMessage(ctx, &sqs.SendMessageInput{
-		QueueUrl:    aws.String(q.url),
-		MessageBody: aws.String(string(m.Body)),
-		MessageAttributes: map[string]types.MessageAttributeValue{
-			attrTopic: {DataType: aws.String("String"), StringValue: aws.String(m.Topic)},
-			attrID:    {DataType: aws.String("String"), StringValue: aws.String(m.ID)},
-		},
+		QueueUrl:          aws.String(q.url),
+		MessageBody:       aws.String(string(m.Body)),
+		MessageAttributes: attrs,
 	})
 	if err != nil {
 		return fmt.Errorf("queue: send %s: %w", m.ID, err)
@@ -69,7 +74,7 @@ func (q *SQS) Receive(ctx context.Context, n int) ([]Delivery, error) {
 		QueueUrl:                    aws.String(q.url),
 		MaxNumberOfMessages:         int32(min(max(n, 1), 10)),
 		WaitTimeSeconds:             q.Wait,
-		MessageAttributeNames:       []string{attrTopic, attrID},
+		MessageAttributeNames:       []string{attrTopic, attrID, attrTrace},
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameApproximateReceiveCount},
 	})
 	if err != nil {
@@ -80,9 +85,10 @@ func (q *SQS) Receive(ctx context.Context, n int) ([]Delivery, error) {
 		n, _ := strconv.Atoi(m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
 		ds = append(ds, Delivery{
 			Message: Message{
-				ID:    attr(m.MessageAttributes, attrID),
-				Topic: attr(m.MessageAttributes, attrTopic),
-				Body:  []byte(aws.ToString(m.Body)),
+				ID:          attr(m.MessageAttributes, attrID),
+				Topic:       attr(m.MessageAttributes, attrTopic),
+				Body:        []byte(aws.ToString(m.Body)),
+				TraceParent: attr(m.MessageAttributes, attrTrace),
 			},
 			Receipt:  aws.ToString(m.ReceiptHandle),
 			Receives: n,
@@ -101,6 +107,26 @@ func (q *SQS) Ack(ctx context.Context, d Delivery) error {
 		return fmt.Errorf("queue: delete %s: %w", d.ID, err)
 	}
 	return nil
+}
+
+// Depth returns the approximate number of visible messages in the queue
+// at url (this queue, or its dead-letter queue).
+func (q *SQS) Depth(ctx context.Context, url string) (int64, error) {
+	if url == "" {
+		url = q.url
+	}
+	out, err := q.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(url),
+		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("queue: depth of %s: %w", url, err)
+	}
+	n, err := strconv.ParseInt(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("queue: depth of %s: %w", url, err)
+	}
+	return n, nil
 }
 
 func attr(m map[string]types.MessageAttributeValue, k string) string {

@@ -1,6 +1,9 @@
 package outbox
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"cmp"
 	"context"
 	"fmt"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/darkodi/ferry/internal/outbox/outboxdb"
 	"github.com/darkodi/ferry/internal/platform/db"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/platform/queue"
 )
 
@@ -73,11 +77,11 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 	var published []int64
 	var pubErr error
 	for _, row := range rows {
-		err := r.pub.Publish(ctx, queue.Message{
-			ID:    strconv.FormatInt(row.ID, 10),
-			Topic: row.Topic,
-			Body:  row.Payload,
-		})
+		m := queue.Message{ID: strconv.FormatInt(row.ID, 10), Topic: row.Topic, Body: row.Payload}
+		if row.Traceparent != nil {
+			m.TraceParent = *row.Traceparent
+		}
+		err := r.publish(ctx, m)
 		if err != nil {
 			pubErr = fmt.Errorf("outbox: publish %d: %w", row.ID, err)
 			break // keep order: later rows wait for the next round
@@ -87,7 +91,20 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 	if err := r.mark(ctx, published); err != nil {
 		return 0, err
 	}
+	obs.OutboxPublished.Add(float64(len(published)))
 	return len(published), pubErr
+}
+
+// publish sends one event inside a span that continues the trace of the
+// request that wrote it.
+func (r *Relay) publish(ctx context.Context, m queue.Message) error {
+	ctx, span := obs.Tracer.Start(obs.WithTraceParent(ctx, m.TraceParent), "outbox.publish "+m.Topic,
+		trace.WithSpanKind(trace.SpanKindProducer), trace.WithAttributes(attribute.String("message_id", m.ID)))
+	defer span.End()
+	if tp := obs.TraceParent(ctx); tp != "" {
+		m.TraceParent = tp // the consumer's parent is this publish span
+	}
+	return r.pub.Publish(ctx, m)
 }
 
 // claim leases the next batch of unpublished rows, oldest first.

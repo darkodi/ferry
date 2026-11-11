@@ -56,5 +56,43 @@ services:
       timeout: 3s
       retries: 60
 
+  # Observability (profile "observability": `make obs-up`). Nothing is
+  # reachable beyond this machine: Prometheus and Grafana use host
+  # networking (to scrape the binaries' loopback metrics ports) and listen
+  # on 127.0.0.1; Jaeger binds every interface inside its container, so it
+  # stays on the bridge network with its ports published on 127.0.0.1.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [observability]
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.listen-address=127.0.0.1:9090
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    profiles: [observability]
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    profiles: [observability]
+    ports:
+      - "127.0.0.1:16686:16686" # UI
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP, where Ferry sends traces
+
 volumes:
   pgdata:

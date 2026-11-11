@@ -1,6 +1,10 @@
 package payout
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +19,7 @@ import (
 	"github.com/darkodi/ferry/internal/outbox"
 	"github.com/darkodi/ferry/internal/payout/payoutdb"
 	"github.com/darkodi/ferry/internal/platform/db"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/rail"
 )
 
@@ -291,8 +296,10 @@ func (s *Service) Confirm(ctx context.Context, customerID, id uuid.UUID) (Payout
 //     the payout is not released, because the rail may have accepted it.
 //
 // Submitting a payout that is not held returns it unchanged.
-func (s *Service) Submit(ctx context.Context, id uuid.UUID) (Payout, error) {
-	p, err := s.load(ctx, id)
+func (s *Service) Submit(ctx context.Context, id uuid.UUID) (p Payout, err error) {
+	ctx, span := obs.Tracer.Start(ctx, "payout.submit", trace.WithAttributes(attribute.String("payout_id", id.String())))
+	defer func() { s.finish(span, p, err) }()
+	p, err = s.load(ctx, id)
 	if err != nil {
 		return Payout{}, err
 	}
@@ -385,8 +392,10 @@ func (s *Service) attempt(ctx context.Context, p Payout) (payoutdb.RailTransacti
 // and applies anything new: settlement, failure or a bank return. It is
 // what a webhook triggers (M5): the webhook says "look again", and only
 // the rail's own answer moves money.
-func (s *Service) Sync(ctx context.Context, id uuid.UUID) (Payout, error) {
-	p, err := s.load(ctx, id)
+func (s *Service) Sync(ctx context.Context, id uuid.UUID) (p Payout, err error) {
+	ctx, span := obs.Tracer.Start(ctx, "payout.sync", trace.WithAttributes(attribute.String("payout_id", id.String())))
+	defer func() { s.finish(span, p, err) }()
+	p, err = s.load(ctx, id)
 	if err != nil {
 		return Payout{}, err
 	}
@@ -557,6 +566,19 @@ type event struct {
 // update, then extra (ledger entry, rail row), then the outbox event. If
 // another request moved the payout first, nothing is written and the
 // current payout is returned without an error.
+// finish ends a span for one payout operation: its resulting state, and
+// a rail report that cannot be true counted for the alert.
+func (s *Service) finish(span trace.Span, p Payout, err error) {
+	span.SetAttributes(attribute.String("status", string(p.Status)))
+	if errors.Is(err, ErrRailMismatch) {
+		obs.RailMismatches.WithLabelValues(s.rail.Name()).Inc()
+	}
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+}
+
 func (s *Service) step(ctx context.Context, p Payout, to State, reason string, extra func(pgx.Tx) error) (Payout, error) {
 	if !CanTransition(p.Status, to) {
 		return p, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, p.Status, to)
@@ -585,7 +607,12 @@ func (s *Service) step(ctx context.Context, p Payout, to State, reason string, e
 	if err != nil && !errors.Is(err, errLost) {
 		return p, err
 	}
-	return s.load(ctx, p.ID)
+	next, err := s.load(ctx, p.ID)
+	if err == nil && next.Status == to && p.Status != to {
+		obs.PayoutTransitions.WithLabelValues(string(p.Status), string(to)).Inc()
+		obs.PayoutTransitionAge.WithLabelValues(string(to)).Observe(time.Since(next.CreatedAt).Seconds())
+	}
+	return next, err
 }
 
 func (s *Service) load(ctx context.Context, id uuid.UUID) (Payout, error) {

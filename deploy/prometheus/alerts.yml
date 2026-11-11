@@ -1,0 +1,140 @@
+# Ferry alert rules. Each alert names what to look at; the runbook is the
+# failure table and threat model in docs/. Locally they show on the
+# Prometheus Alerts page; on AWS (M7) Alertmanager routes them.
+groups:
+  - name: ferry-money
+    rules:
+      - alert: FerryInvariantViolation
+        expr: ferry_recon_breaks_open{check="internal"} > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "A ledger or payout invariant is broken ({{ $value }} open internal breaks)"
+          description: "GET /v1/admin/recon-breaks. Fix with a correction entry naming the break; never by editing history."
+
+      - alert: FerryRailMismatch
+        expr: increase(ferry_rail_mismatch_total[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "The rail reported something impossible for a payout"
+          description: "Nothing was applied (ErrRailMismatch). Logs carry the payout_id; check the rail transaction by hand."
+
+      - alert: FerryCreditedDepositReorged
+        expr: increase(ferry_watcher_credited_reorged_total[1h]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "A reorg removed a deposit already credited on {{ $labels.chain }}"
+          description: "Post a correction entry for the deposit_id in the watcher logs; raise confirmations."
+
+      - alert: FerryDeepReorg
+        expr: increase(ferry_watcher_deep_reorg_total[1h]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Reorg deeper than stored history on {{ $labels.chain }}; the watcher stopped"
+
+      - alert: FerryReconBreakOld
+        expr: ferry_recon_oldest_open_break_seconds > 86400
+        labels: { severity: warning }
+        annotations:
+          summary: "A {{ $labels.check }} reconciliation break has been open for over 24 hours"
+          description: "GET /v1/admin/recon-breaks; resolve with a reason or fix with a correction."
+
+      - alert: FerryReconNotRunning
+        expr: ferry_recon_last_run_age_seconds > 26 * 3600
+        labels: { severity: warning }
+        annotations:
+          summary: "Reconciliation has not completed a run in over 26 hours"
+
+  - name: ferry-payouts
+    rules:
+      - alert: FerryPayoutSubmittedPastSLA
+        # Bank payouts take up to a day (Noah's ACH channel: 86400 s); a
+        # payout under compliance review is excluded, it may take 10 days.
+        expr: ferry_payout_oldest_in_state_seconds{status="submitted",review="false"} > 26 * 3600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "A payout has been submitted for over 26 hours with no review in progress"
+
+      - alert: FerryPayoutHeldStuck
+        # The worker submits within seconds and the resolver re-drives after a minute.
+        expr: ferry_payout_oldest_in_state_seconds{status="held"} > 600
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A payout has been held for over 10 minutes without reaching the rail"
+
+      - alert: FerryPayoutsNeedResolution
+        expr: ferry_payouts_needs_resolution > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} payouts have had an unknown submit outcome for 15 minutes"
+
+      - alert: FerryRailErrors
+        expr: |
+          sum(rate(ferry_rail_requests_total{outcome="error"}[5m]))
+            / sum(rate(ferry_rail_requests_total[5m])) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 20% of rail calls fail"
+
+  - name: ferry-pipeline
+    rules:
+      - alert: FerryOutboxLag
+        expr: ferry_outbox_lag_seconds > 60
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Outbox events wait over a minute to be published (is cmd/relay running?)"
+
+      - alert: FerryDLQNotEmpty
+        expr: ferry_queue_messages{queue="payouts-dlq"} > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} messages in the dead-letter queue"
+          description: "Poison messages: inspect, fix, then redrive. The resolver keeps the payouts moving meanwhile."
+
+      - alert: FerryWatcherLag
+        expr: ferry_watcher_lag_blocks > 100
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "The {{ $labels.chain }} watcher is {{ $value }} blocks behind"
+
+      - alert: FerryWatcherErrors
+        expr: increase(ferry_watcher_rounds_total{result="error"}[10m]) > 5
+        labels: { severity: warning }
+        annotations:
+          summary: "The {{ $labels.chain }} watcher keeps failing (RPC down?)"
+
+      - alert: FerryTargetDown
+        expr: up{job="ferry"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Ferry {{ $labels.service }} is not answering metrics scrapes"
+
+      - alert: FerryCollectorErrors
+        expr: increase(ferry_collector_errors_total[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "State gauges ({{ $labels.collector }}) could not be read; dashboards may be stale"
+
+  - name: ferry-api
+    rules:
+      - alert: FerryAPIErrors
+        expr: |
+          sum(rate(ferry_http_requests_total{code=~"5.."}[5m]))
+            / sum(rate(ferry_http_requests_total[5m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 5% of API requests fail with 5xx"
+
+      - alert: FerryWebhookBadSignatures
+        expr: increase(ferry_webhooks_total{result="bad_signature"}[15m]) > 10
+        labels: { severity: warning }
+        annotations:
+          summary: "Many webhooks with bad signatures: someone is probing /v1/webhooks"

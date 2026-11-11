@@ -338,3 +338,29 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 - **Solana is read "now".** A deposit finalized but not yet scanned shows as an `address_balance` break that the next run clears.
 - **Deposits before the watcher started** sit on-chain without a deposit row, so they remain `address_balance` breaks until a person resolves or corrects them. That's by design: Ferry never credits money it did not see arrive.
 
+## Observability (M6)
+
+Metrics endpoints, trace export (OTLP) and the local Prometheus, Grafana and Jaeger.
+
+**Assets:**
+- the confidentiality of what telemetry reveals (volumes, timings, ids);
+- the integrity of alerts (an attacker who can silence them can act unnoticed).
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **I**nformation disclosure: telemetry leaks secrets | Bank details or keys in spans, labels or logs | Spans carry only ids, routes, statuses and outcomes; the Noah client span never includes bodies or headers; metric labels use route patterns, not raw paths | `TestTraceCrossesTheQueue` (span names), manual check of the Jaeger trace |
+| **I**nformation disclosure: telemetry exposed | `/metrics` or the Jaeger UI reachable from the network | Metrics listeners default to 127.0.0.1 and are separate from the API port. The local stack listens on loopback only. Jaeger 2.22 binds every interface, so it runs on the bridge network with 127.0.0.1-only port mappings (found in the manual run; host networking would have exposed it) | `ss -ltn` in the manual run |
+| **T**ampering: a caller steers tracing | A client sends `traceparent` with the sampled flag off, hiding its requests from traces | The API starts every trace itself (`WithNewRoot`); propagation is honoured only on internal hops (outbox, queue) | code review |
+| **T**ampering: alert drift | A metric is renamed and an alert silently stops matching | `TestDeployReferencesKnownMetrics` checks every metric named in the rules and the dashboard; `make alerts-check` validates the rules with promtool | both |
+| **R**epudiation | "We never saw that payout get stuck" | Alerts on held or submitted age, DLQ, outbox lag and invariant breaks, plus a trace per payout step | `make alerts-check` |
+| **D**enial of service: label explosion | Ids in labels blow up Prometheus memory | Labels are bounded sets (route patterns, states, outcomes, chain names); `unmatched` for unknown routes | `TestDeployReferencesKnownMetrics`, code review |
+| **D**enial of service: slow scrapes | State queries on every scrape load Postgres | Only the API collects state gauges, with a 3 s timeout; failures count in `ferry_collector_errors_total` (alerted) | `TestDBCollector` |
+
+### Residual risks
+
+- **No Alertmanager yet.** Alerts are visible in Prometheus; routing them to a person (SNS, pager) is M7.
+- **Grafana allows anonymous read-only access locally.** That's fine on loopback; on AWS it goes behind SSO (M7).
+- **The trace exporter has no authentication.** OTLP goes to a local collector; on AWS the collector runs in the private subnet (M7).
+

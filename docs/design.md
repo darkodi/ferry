@@ -604,6 +604,25 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 - Alerts: outbox lag > 1 minute, payouts in `submitted` beyond SLA, DLQ non-empty, watcher lag > threshold, any invariant violation.
 - A Grafana dashboard JSON committed to the repo, with a screenshot in the README.
 
+**As built (M6)** (`internal/platform/obs`):
+
+- **Metrics.** Every binary serves `/metrics` on its own loopback port, separate from the API (`FERRY_METRICS_ADDR`; api 9101, relay 9102, worker 9103, watchers 9104/9105). There are two kinds:
+  - *Event metrics* are counted where things happen: transitions and time-to-state, rail calls (via `obs.InstrumentRail`, a decorator, so adapters stay clean), webhooks by result, worker messages, watcher rounds, lag, deposits and reorg alerts, and API requests by **route pattern** (ids never become labels).
+  - *State gauges* are read from Postgres on each scrape by the API process only, so they aren't duplicated: payouts by state, the oldest held or submitted payout (split by whether a review or RFI is in progress), `needs_resolution`, outbox lag, open breaks by check, and time since the last recon run. The worker reports queue and DLQ depth.
+- **Traces.** OpenTelemetry, W3C Trace Context. The API starts a new trace per request and ignores a client's `traceparent`: with parent-based sampling a caller could otherwise opt its own requests out of tracing.
+  - `outbox.Write` stores the current `traceparent` with the event (migration 00012). The relay publishes it as an SQS message attribute, and the worker continues the trace. One trace therefore shows `HTTP POST /v1/payouts/{id}/confirm` → `outbox.publish` → `worker payout.held` → `payout.submit` → `rail.submit` → `noah POST /transactions/sell`.
+  - Spans carry ids and outcomes, never bodies: no bank details, no keys.
+  - Spans are always created, so log lines carry `trace_id` and `span_id`. They are exported over OTLP/HTTP only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (Jaeger locally, a collector on AWS).
+- **Alerts** (`deploy/prometheus/alerts.yml`, 18 rules, checked by `make alerts-check`):
+  - money: invariant violation, rail mismatch, credited deposit reorged, deep reorg, break older than 24 h, recon not run in 26 h;
+  - payouts: submitted past 26 h without review, held over 10 min, unknown submit outcome for 15 min, rail error rate;
+  - pipeline: outbox lag over 1 min, DLQ not empty, watcher lag and errors, a target down, collector errors;
+  - API: 5xx rate, bad webhook signatures.
+
+  `TestDeployReferencesKnownMetrics` fails if a rule or panel names a metric the code doesn't define.
+- **Dashboard** (`deploy/grafana/dashboards/ferry.json`), provisioned into Grafana: payouts, rail, pipeline, chains, reconciliation, API.
+- **Local stack:** `make obs-up` starts Prometheus (127.0.0.1:9090), Grafana (127.0.0.1:3000) and Jaeger (127.0.0.1:16686, OTLP on 127.0.0.1:4318). Nothing listens beyond loopback.
+
 ### Security
 
 - **Inbound API:** API keys hashed at rest, per-key scopes, rate limits; outbound customer webhooks signed (HMAC with timestamp) to block replays.
@@ -669,7 +688,7 @@ Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcont
 3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
 4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test. *(done; the treasury sweep is deferred, see Blockchain integration)*
 5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox. *(done: destinations, signed adapter, standalone worker, verified webhooks and returns; the real sandbox is still to be run once a key exists)*
-6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard. *(PR 1: reconciliation, treasury top-ups; PR 2: metrics, traces, alerts, dashboard)*
+6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard. *(done: reconciliation, treasury top-ups, metrics, traces, alerts, dashboard)*
 7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video.
 
 ### Open questions

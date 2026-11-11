@@ -18,6 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -42,6 +46,8 @@ var (
 	srv    *httptest.Server
 	relay  *outbox.Relay
 	worker *payout.Worker
+	// spans records every span the package's tests create.
+	spans = tracetest.NewSpanRecorder()
 )
 
 func TestMain(m *testing.M) {
@@ -54,6 +60,7 @@ func TestMain(m *testing.M) {
 
 func run(m *testing.M) int {
 	ctx := context.Background()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)))
 	tdb, err := pgtest.Start(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "start test database:", err)

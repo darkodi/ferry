@@ -11,6 +11,8 @@
 //	                     With noah, POST /v1/webhooks/noah verifies Noah's webhooks with Noah's
 //	                     published key, or NOAH_WEBHOOK_PUBLIC_KEY (a PEM file) if set
 //	FERRY_DATA_KEY       base64 32-byte key that encrypts saved bank details (required)
+//	FERRY_METRICS_ADDR   Prometheus /metrics listener (default 127.0.0.1:9101; "off" disables)
+//	OTEL_EXPORTER_OTLP_ENDPOINT  where traces go (e.g. http://localhost:4318); empty exports none
 //	FERRY_SQS_QUEUE_URL  dev mode: payout queue (ElasticMQ); empty uses an in-memory queue
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. http://localhost:9324
 //	FERRY_EVM_CHAIN      EVM chain name in the database (default evm-local)
@@ -43,6 +45,7 @@ import (
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
 	"github.com/darkodi/ferry/internal/payout"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/platform/queue"
 	"github.com/darkodi/ferry/internal/rail"
 	"github.com/darkodi/ferry/internal/rail/mock"
@@ -51,7 +54,7 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := obs.NewLogger()
 	if err := run(log); err != nil {
 		log.Error("api stopped", "error", err)
 		os.Exit(1)
@@ -80,6 +83,14 @@ func run(log *slog.Logger) error {
 	// Cancelled on Ctrl-C or SIGTERM, which starts a graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTraces, err := obs.Setup(ctx, "ferry-api")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = shutdownTraces(context.Background()) }()
+	if err := obs.Serve(ctx, envOr("FERRY_METRICS_ADDR", "127.0.0.1:9101"), log); err != nil {
+		return err
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -99,7 +110,10 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	payouts := payout.NewService(pool, rl, dests, house, time.Now)
+	payouts := payout.NewService(pool, obs.InstrumentRail(rl), dests, house, time.Now)
+	// State gauges (payouts by state, outbox lag, open breaks) are read
+	// from the database by this process only, so they are not duplicated.
+	obs.Registry.MustRegister(obs.NewDBCollector(pool))
 
 	// In dev the relay, worker and resolver run in this process. The mock
 	// rail lives in this process's memory, so with it they must; with

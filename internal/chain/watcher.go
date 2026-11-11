@@ -15,6 +15,7 @@ import (
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
 	"github.com/darkodi/ferry/internal/platform/db"
+	"github.com/darkodi/ferry/internal/platform/obs"
 )
 
 // Watcher turns one chain's transfers into credited deposits.
@@ -112,6 +113,7 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) error {
 
 	for {
 		res, err := w.RunOnce(ctx)
+		w.record(res, err)
 		switch {
 		case errors.Is(err, ErrDeepReorg):
 			return err
@@ -129,6 +131,23 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) error {
 			return nil
 		}
 	}
+}
+
+// record updates the watcher's metrics after a round.
+func (w *Watcher) record(res Result, err error) {
+	chain := w.chain.Chain()
+	switch {
+	case errors.Is(err, ErrDeepReorg):
+		obs.WatcherDeepReorgs.WithLabelValues(chain).Inc()
+		obs.WatcherRounds.WithLabelValues(chain, "error").Inc()
+	case err != nil:
+		obs.WatcherRounds.WithLabelValues(chain, "error").Inc()
+	default:
+		obs.WatcherRounds.WithLabelValues(chain, "ok").Inc()
+	}
+	obs.WatcherDeposits.WithLabelValues(chain, "found").Add(float64(res.Found))
+	obs.WatcherDeposits.WithLabelValues(chain, "confirmed").Add(float64(res.Confirmed))
+	obs.WatcherDeposits.WithLabelValues(chain, "orphaned").Add(float64(res.Orphaned))
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
@@ -180,6 +199,12 @@ func (w *Watcher) RunOnce(ctx context.Context) (Result, error) {
 			return res, err
 		}
 		res.Scanned = to - cur.number
+	}
+
+	// How far behind the head the scan is, after this round.
+	scanned := cur.number + res.Scanned
+	if head.Number >= scanned {
+		obs.WatcherLag.WithLabelValues(w.chain.Chain()).Set(float64(head.Number - scanned))
 	}
 
 	// 3. Confirm.
@@ -273,6 +298,7 @@ func (w *Watcher) moveCursorBack(ctx context.Context, fork cursor) error {
 			return fmt.Errorf("chain: confirmed deposits above fork: %w", err)
 		}
 		for _, id := range credited {
+			obs.WatcherCreditedReorged.WithLabelValues(w.chain.Chain()).Inc()
 			w.log.ErrorContext(ctx, "reorg removed a credited deposit; needs a correction entry", "deposit_id", id)
 		}
 		if err := q.DeleteBlocksAbove(ctx, chaindb.DeleteBlocksAboveParams{Chain: w.chain.Chain(), Number: above}); err != nil {
