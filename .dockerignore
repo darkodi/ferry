@@ -1,0 +1,13 @@
+# Only what the build needs goes into the context.
+.git
+.github
+.dev
+.env
+.env.*
+bin
+coverage.*
+*.test
+docs
+deploy
+contracts/build/*.bin.*
+**/testdata/fuzz

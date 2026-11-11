@@ -20,7 +20,8 @@
 //	FERRY_SOLANA_CHAIN             chain name in the database (default solana-local); must match cmd/api
 //	FERRY_SOLANA_RPC_URL           JSON-RPC endpoint (required)
 //	FERRY_SOLANA_USDC_MINT         USDC mint (required)
-//	FERRY_SOLANA_AUTHORITY_KEYPAIR path to the authority's keypair file (solana-keygen JSON, required);
+//	FERRY_SOLANA_AUTHORITY_KMS_KEY_ID  the authority as an AWS KMS Ed25519 key (it never leaves KMS), or
+//	FERRY_SOLANA_AUTHORITY_KEYPAIR path to the authority's keypair file (solana-keygen JSON, local);
 //	                               it pays for and signs deposit account creation, nothing else
 //	FERRY_SOLANA_DEPOSIT_OWNER     public key that owns the deposit token accounts (required); its
 //	                               private key moves funds and is never given to Ferry
@@ -48,6 +49,7 @@ import (
 	"github.com/darkodi/ferry/internal/chain/evm"
 	"github.com/darkodi/ferry/internal/chain/solana"
 	"github.com/darkodi/ferry/internal/ledger"
+	"github.com/darkodi/ferry/internal/platform/awskms"
 	"github.com/darkodi/ferry/internal/platform/obs"
 )
 
@@ -127,7 +129,7 @@ func evmWatcher(ctx context.Context, pool *pgxpool.Pool, house ledger.HouseAccou
 	return w, nil
 }
 
-func solanaWatcher(_ context.Context, pool *pgxpool.Pool, house ledger.HouseAccounts, log *slog.Logger) (*chain.Watcher, error) {
+func solanaWatcher(ctx context.Context, pool *pgxpool.Pool, house ledger.HouseAccounts, log *slog.Logger) (*chain.Watcher, error) {
 	name := envOr("FERRY_SOLANA_CHAIN", "solana-local")
 	url := os.Getenv("FERRY_SOLANA_RPC_URL")
 	if url == "" {
@@ -137,14 +139,9 @@ func solanaWatcher(_ context.Context, pool *pgxpool.Pool, house ledger.HouseAcco
 	if err != nil {
 		return nil, fmt.Errorf("FERRY_SOLANA_USDC_MINT: %w", err)
 	}
-	keyPath := os.Getenv("FERRY_SOLANA_AUTHORITY_KEYPAIR")
-	if keyPath == "" {
-		return nil, errors.New("FERRY_SOLANA_AUTHORITY_KEYPAIR is required")
-	}
-	key, err := sol.PrivateKeyFromSolanaKeygenFile(keyPath)
+	signer, err := authoritySigner(ctx)
 	if err != nil {
-		// The error names the file, never its contents.
-		return nil, fmt.Errorf("read authority keypair %s: %w", keyPath, err)
+		return nil, err
 	}
 	owner, err := sol.PublicKeyFromBase58(os.Getenv("FERRY_SOLANA_DEPOSIT_OWNER"))
 	if err != nil {
@@ -155,7 +152,7 @@ func solanaWatcher(_ context.Context, pool *pgxpool.Pool, house ledger.HouseAcco
 		return nil, fmt.Errorf("FERRY_SOLANA_START_SLOT: %w", err)
 	}
 	client := rpc.New(url)
-	prov, err := solana.NewProvisioner(client, key, mint, owner)
+	prov, err := solana.NewProvisionerWithSigner(client, signer, mint, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +162,36 @@ func solanaWatcher(_ context.Context, pool *pgxpool.Pool, house ledger.HouseAcco
 	w.Provisioner = prov
 	log.Info("watcher configured", "chain", name, "mint", mint.String(), "authority", prov.Authority().String(), "deposit_owner", owner.String())
 	return w, nil
+}
+
+// authoritySigner returns the Solana authority: a key in AWS KMS
+// (FERRY_SOLANA_AUTHORITY_KMS_KEY_ID, ECC_NIST_EDWARDS25519) or, locally,
+// a keypair file (FERRY_SOLANA_AUTHORITY_KEYPAIR). Exactly one is set.
+func authoritySigner(ctx context.Context) (solana.TxSigner, error) {
+	keyPath, kmsKey := os.Getenv("FERRY_SOLANA_AUTHORITY_KEYPAIR"), os.Getenv("FERRY_SOLANA_AUTHORITY_KMS_KEY_ID")
+	switch {
+	case keyPath != "" && kmsKey != "":
+		return nil, errors.New("set FERRY_SOLANA_AUTHORITY_KEYPAIR or FERRY_SOLANA_AUTHORITY_KMS_KEY_ID, not both")
+	case kmsKey != "":
+		api, err := awskms.New(ctx, os.Getenv("FERRY_KMS_ENDPOINT"))
+		if err != nil {
+			return nil, err
+		}
+		ks, err := awskms.NewEd25519Signer(ctx, api, kmsKey)
+		if err != nil {
+			return nil, err
+		}
+		return solana.KMSSigner(ks), nil
+	case keyPath != "":
+		key, err := sol.PrivateKeyFromSolanaKeygenFile(keyPath)
+		if err != nil {
+			// The error names the file, never its contents.
+			return nil, fmt.Errorf("read authority keypair %s: %w", keyPath, err)
+		}
+		return solana.KeySigner(key), nil
+	default:
+		return nil, errors.New("FERRY_SOLANA_AUTHORITY_KEYPAIR or FERRY_SOLANA_AUTHORITY_KMS_KEY_ID is required")
+	}
 }
 
 func envOr(key, def string) string {

@@ -1,6 +1,7 @@
 package noah
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -35,16 +36,38 @@ const signatureTTL = 5 * time.Minute
 // the token has one fixed header and a handful of claims, and owning the
 // encoding makes the bytes that are signed obvious.
 type Signer struct {
-	key *ecdsa.PrivateKey
+	ds  DigestSigner
 	now func() time.Time
 }
 
-// NewSigner returns a signer for a P-384 private key.
+// DigestSigner signs a SHA-384 digest with a P-384 key: a local key, or
+// one held in AWS KMS (awskms.ECDSASigner) that Ferry never sees.
+type DigestSigner interface {
+	SignDigest(ctx context.Context, digest []byte) (r, s *big.Int, err error)
+}
+
+// localKey signs with a private key in memory (local development).
+type localKey struct{ k *ecdsa.PrivateKey }
+
+func (l localKey) SignDigest(_ context.Context, digest []byte) (r, s *big.Int, err error) {
+	return ecdsa.Sign(rand.Reader, l.k, digest) //nolint:wrapcheck // the caller wraps it
+}
+
+// NewSigner returns a signer for a P-384 private key in memory.
 func NewSigner(key *ecdsa.PrivateKey, now func() time.Time) (*Signer, error) {
 	if key == nil || key.Curve != elliptic.P384() {
 		return nil, errors.New("noah: request signing key must be an ECDSA P-384 key (ES384)")
 	}
-	return &Signer{key: key, now: now}, nil
+	return &Signer{ds: localKey{key}, now: now}, nil
+}
+
+// NewDigestSigner returns a signer that signs through ds, whose public
+// key is pub (checked to be P-384), e.g. a KMS key.
+func NewDigestSigner(ds DigestSigner, pub *ecdsa.PublicKey, now func() time.Time) (*Signer, error) {
+	if ds == nil || pub == nil || pub.Curve != elliptic.P384() {
+		return nil, errors.New("noah: request signing key must be an ECDSA P-384 key (ES384)")
+	}
+	return &Signer{ds: ds, now: now}, nil
 }
 
 // ParseSigningKey reads a PEM private key as produced by
@@ -95,7 +118,7 @@ var jwtHeader = base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES384","typ
 // path including the /v1 prefix; body is exactly the bytes that will be
 // sent (nil for none). A query parameter given twice is refused: the
 // claim is a flat map, so it could not describe the request.
-func (s *Signer) Sign(method, path string, query url.Values, body []byte) (string, error) {
+func (s *Signer) Sign(ctx context.Context, method, path string, query url.Values, body []byte) (string, error) {
 	now := s.now()
 	c := Claims{
 		Audience: Audience,
@@ -123,9 +146,14 @@ func (s *Signer) Sign(method, path string, query url.Values, body []byte) (strin
 	}
 	signingInput := jwtHeader + "." + base64.RawURLEncoding.EncodeToString(payload)
 	digest := sha512.Sum384([]byte(signingInput))
-	r, ss, err := ecdsa.Sign(rand.Reader, s.key, digest[:])
+	r, ss, err := s.ds.SignDigest(ctx, digest[:])
 	if err != nil {
 		return "", fmt.Errorf("noah: sign request: %w", err)
+	}
+	// r and s are below the curve order, so they fit 48 bytes; a signer
+	// returning more is broken (FillBytes would panic).
+	if r.BitLen() > 384 || ss.BitLen() > 384 || r.Sign() <= 0 || ss.Sign() <= 0 {
+		return "", errors.New("noah: signer returned an out-of-range signature")
 	}
 	// JWS (RFC 7518 §3.4) uses the raw r||s, each left-padded to the
 	// curve size (48 bytes for P-384), not the ASN.1 DER form.

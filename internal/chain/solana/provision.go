@@ -2,6 +2,7 @@ package solana
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"time"
@@ -27,7 +28,7 @@ const TokenAccountSize = 165
 // implements chain.Provisioner.
 type Provisioner struct {
 	rpc       *rpc.Client
-	key       sol.PrivateKey
+	signer    TxSigner
 	authority sol.PublicKey
 	mint      sol.PublicKey
 	owner     sol.PublicKey
@@ -45,10 +46,66 @@ func NewProvisioner(client *rpc.Client, key sol.PrivateKey, mint, owner sol.Publ
 	if !key.IsValid() {
 		return nil, errors.New("solana: invalid authority private key")
 	}
-	if owner.IsZero() || owner == key.PublicKey() {
+	return NewProvisionerWithSigner(client, KeySigner(key), mint, owner)
+}
+
+// NewProvisionerWithSigner is NewProvisioner for an authority that signs
+// elsewhere, such as a KMS key (KMSSigner).
+func NewProvisionerWithSigner(client *rpc.Client, signer TxSigner, mint, owner sol.PublicKey) (*Provisioner, error) {
+	if signer == nil || signer.PublicKey().IsZero() {
+		return nil, errors.New("solana: no authority signer")
+	}
+	if owner.IsZero() || owner == signer.PublicKey() {
 		return nil, errors.New("solana: the deposit owner must be set and differ from the provisioning authority")
 	}
-	return &Provisioner{rpc: client, key: key, authority: key.PublicKey(), mint: mint, owner: owner, Timeout: 60 * time.Second}, nil
+	return &Provisioner{rpc: client, signer: signer, authority: signer.PublicKey(), mint: mint, owner: owner, Timeout: 60 * time.Second}, nil
+}
+
+// TxSigner signs transaction messages for the authority: a keypair in
+// memory (KeySigner, local development) or a key held in AWS KMS
+// (KMSSigner), which Ferry never sees.
+type TxSigner interface {
+	PublicKey() sol.PublicKey
+	SignMessage(ctx context.Context, msg []byte) (sol.Signature, error)
+}
+
+// KeySigner signs with a private key in memory.
+func KeySigner(k sol.PrivateKey) TxSigner { return keySigner{k} }
+
+type keySigner struct{ k sol.PrivateKey }
+
+func (s keySigner) PublicKey() sol.PublicKey { return s.k.PublicKey() }
+func (s keySigner) SignMessage(_ context.Context, msg []byte) (sol.Signature, error) {
+	sig, err := s.k.Sign(msg)
+	if err != nil {
+		return sol.Signature{}, fmt.Errorf("solana: sign: %w", err)
+	}
+	return sig, nil
+}
+
+// Ed25519Signer is a raw Ed25519 signer, such as awskms.Ed25519Signer.
+type Ed25519Signer interface {
+	Public() ed25519.PublicKey
+	Sign(ctx context.Context, msg []byte) ([]byte, error)
+}
+
+// KMSSigner adapts an Ed25519 signer (a KMS ECC_NIST_EDWARDS25519 key) to
+// sign Solana transactions: a Solana signature is a plain Ed25519
+// signature over the serialized message.
+func KMSSigner(s Ed25519Signer) TxSigner { return kmsSigner{s} }
+
+type kmsSigner struct{ s Ed25519Signer }
+
+func (k kmsSigner) PublicKey() sol.PublicKey { return sol.PublicKeyFromBytes(k.s.Public()) }
+func (k kmsSigner) SignMessage(ctx context.Context, msg []byte) (sol.Signature, error) {
+	sig, err := k.s.Sign(ctx, msg)
+	if err != nil {
+		return sol.Signature{}, fmt.Errorf("solana: sign: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return sol.Signature{}, fmt.Errorf("solana: signature is %d bytes, want %d", len(sig), ed25519.SignatureSize)
+	}
+	return sol.SignatureFromBytes(sig), nil
 }
 
 // Authority returns the public key the provisioner signs with.
@@ -166,13 +223,22 @@ func (p *Provisioner) send(ctx context.Context, ixs []sol.Instruction) error {
 	if err != nil {
 		return fmt.Errorf("solana: build transaction: %w", err)
 	}
-	if _, err := tx.Sign(func(k sol.PublicKey) *sol.PrivateKey {
-		if k == p.authority {
-			return &p.key
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("solana: sign: %w", err)
+	// The authority is the only signer (fee payer and seed base). Sign
+	// the serialized message, then check the result before sending.
+	if tx.Message.Header.NumRequiredSignatures != 1 || len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != p.authority {
+		return errors.New("solana: provisioning transaction must have the authority as its only signer")
+	}
+	msg, err := tx.Message.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("solana: serialize transaction: %w", err)
+	}
+	signature, err := p.signer.SignMessage(ctx, msg)
+	if err != nil {
+		return err
+	}
+	tx.Signatures = []sol.Signature{signature}
+	if err := tx.VerifySignatures(); err != nil {
+		return fmt.Errorf("solana: provisioning transaction signature: %w", err)
 	}
 	sig, err := p.rpc.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{PreflightCommitment: rpc.CommitmentConfirmed})
 	if err != nil {

@@ -128,7 +128,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	if c.signer != nil {
 		// The claim's path is the URL path as sent, /v1 prefix included;
 		// the hash covers exactly the bytes in the request body.
-		sig, err := c.signer.Sign(method, u.Path, query, body)
+		sig, err := c.signer.Sign(ctx, method, u.Path, query, body)
 		if err != nil {
 			return err
 		}

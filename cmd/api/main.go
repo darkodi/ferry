@@ -10,7 +10,9 @@
 //	FERRY_RAIL           "mock" (default) or "noah"; see internal/rail/noah.FromEnv for NOAH_*.
 //	                     With noah, POST /v1/webhooks/noah verifies Noah's webhooks with Noah's
 //	                     published key, or NOAH_WEBHOOK_PUBLIC_KEY (a PEM file) if set
-//	FERRY_DATA_KEY       base64 32-byte key that encrypts saved bank details (required)
+//	FERRY_DATA_KEY       base64 32-byte key that encrypts saved bank details (local), or
+//	FERRY_DATA_KEY_ENCRYPTED  the same key wrapped by AWS KMS (base64 CiphertextBlob); it is
+//	                     unwrapped in memory at startup. Exactly one is required.
 //	FERRY_METRICS_ADDR   Prometheus /metrics listener (default 127.0.0.1:9101; "off" disables)
 //	OTEL_EXPORTER_OTLP_ENDPOINT  where traces go (e.g. http://localhost:4318); empty exports none
 //	FERRY_SQS_QUEUE_URL  dev mode: payout queue (ElasticMQ); empty uses an in-memory queue
@@ -45,6 +47,7 @@ import (
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/outbox"
 	"github.com/darkodi/ferry/internal/payout"
+	"github.com/darkodi/ferry/internal/platform/awskms"
 	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/platform/queue"
 	"github.com/darkodi/ferry/internal/rail"
@@ -75,14 +78,14 @@ func run(log *slog.Logger) error {
 	if len(adminKey) < 32 {
 		return errors.New("FERRY_ADMIN_KEY must be at least 32 characters")
 	}
-	dataKey, err := destination.ParseKey(os.Getenv("FERRY_DATA_KEY"))
-	if err != nil {
-		return fmt.Errorf("FERRY_DATA_KEY (create one with `openssl rand -base64 32`): %w", err)
-	}
 
 	// Cancelled on Ctrl-C or SIGTERM, which starts a graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	dataKey, err := loadDataKey(ctx)
+	if err != nil {
+		return err
+	}
 	shutdownTraces, err := obs.Setup(ctx, "ferry-api")
 	if err != nil {
 		return err
@@ -214,6 +217,28 @@ func startBackground(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool
 	return nil
 }
 
+// loadDataKey returns the key that encrypts saved bank details: wrapped by
+// KMS (FERRY_DATA_KEY_ENCRYPTED, AWS) or plain (FERRY_DATA_KEY, local).
+func loadDataKey(ctx context.Context) ([]byte, error) {
+	plain, wrapped := os.Getenv("FERRY_DATA_KEY"), os.Getenv("FERRY_DATA_KEY_ENCRYPTED")
+	switch {
+	case plain != "" && wrapped != "":
+		return nil, errors.New("set FERRY_DATA_KEY or FERRY_DATA_KEY_ENCRYPTED, not both")
+	case wrapped != "":
+		api, err := awskms.New(ctx, os.Getenv("FERRY_KMS_ENDPOINT"))
+		if err != nil {
+			return nil, err
+		}
+		return awskms.DecryptDataKey(ctx, api, wrapped)
+	default:
+		key, err := destination.ParseKey(plain)
+		if err != nil {
+			return nil, fmt.Errorf("FERRY_DATA_KEY (create one with `openssl rand -base64 32`): %w", err)
+		}
+		return key, nil
+	}
+}
+
 // railFromEnv picks the payout rail: the in-memory mock (default; in dev it
 // settles at once) or Noah.
 func railFromEnv(dev bool) (rail.Rail, error) {
@@ -223,7 +248,7 @@ func railFromEnv(dev bool) (rail.Rail, error) {
 		m.AutoSettle = dev
 		return m, nil
 	case "noah":
-		return noah.FromEnv(os.Getenv, time.Now)
+		return noah.FromEnv(context.Background(), os.Getenv, time.Now)
 	default:
 		return nil, fmt.Errorf("unknown FERRY_RAIL %q (want mock or noah)", name)
 	}
