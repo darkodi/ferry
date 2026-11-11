@@ -1,102 +1,106 @@
 # Ferry
 
-A security-first stablecoin payout engine in Go. A business deposits USDC on-chain, then requests a fiat payout to a bank account. Ferry quotes the payout through a fiat rail, holds the funds, submits the payout and settles a double-entry ledger.
+[![ci](https://github.com/darkodi/ferry/actions/workflows/ci.yml/badge.svg)](https://github.com/darkodi/ferry/actions/workflows/ci.yml)
 
-The design, its invariants and its failure modes are in [`docs/design.md`](docs/design.md).
+A security-first stablecoin payout engine in Go. A business deposits USDC on-chain (an EVM testnet or Solana devnet), then asks for a fiat payout to a bank account. Ferry quotes the payout through a fiat rail, holds the funds, submits the payout, follows it to settlement or a bank return, and records every step in a double-entry ledger. The rail is the Noah Business API: Ferry is its client, not a copy of it.
+
+Ferry is a portfolio project by a blockchain security auditor learning production Go. The reasoning matters as much as the code: [`docs/design.md`](docs/design.md) covers the design and its decisions, [`docs/threat-model.md`](docs/threat-model.md) the threats, and [`docs/self-audit.md`](docs/self-audit.md) the issues found in Ferry's own code.
+
+## What it guarantees
+
+- **Money is never created, lost or paid twice.** Every balance change is a balanced journal entry. Postgres itself refuses unbalanced entries, overdrafts and edits to posted history. The application's database role can't update or delete history at all.
+- **Retries are safe everywhere.**
+  - API calls take an `Idempotency-Key`.
+  - Queue consumers deduplicate in the same transaction as their effect.
+  - The Nonce sent to the rail is saved before the call and reused on retry, so a timeout can't cause a second payout.
+- **Any process can crash at any point.** State, ledger entries and the "what happens next" message commit in one transaction ("write first, act second"). A resolver drives unknown outcomes to a known state.
+- **Outside input is untrusted.**
+  - Webhooks are signature-verified, stored, and only trigger a re-fetch from the rail.
+  - Deposits are credited only after confirmations, and reorgs are handled.
+  - Every amount is parsed exactly, never as a float.
+- **Ledger, chain and rail are reconciled.** A daily job compares them and reports every disagreement as a break. It never edits money itself.
+- **Keys don't leave KMS on AWS.** Noah request signing (P-384), the Solana authority (Ed25519) and the bank-details data key live in AWS KMS. Each key policy names the exact services that may use it.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client -->|REST + Idempotency-Key| API
+    Chains["EVM / Solana"] -->|transfers| Watchers
+    API -->|"one transaction:<br/>state + ledger + outbox"| PG[("Postgres")]
+    Watchers -->|deposits| PG
+    PG -->|outbox| Relay --> SQS[["SQS + DLQ"]] --> Worker
+    Worker -->|"submit (same Nonce on retry)"| Noah["Noah API<br/>(fiat rail)"]
+    Noah -->|signed webhooks| API
+    Worker --> PG
+    Recon["Recon (daily)"] -.->|compares| PG & Chains & Noah
+```
+
+| Binary | Job |
+| --- | --- |
+| `api` | REST API, idempotency, quotes, holds, inbound webhooks |
+| `relay` | Outbox → SQS |
+| `worker` | Submits payouts to the rail; the resolver re-drives unknown outcomes |
+| `watcher` | One per chain: detects deposits, waits for confirmations, handles reorgs; on Solana it also creates deposit accounts |
+| `recon` | Reconciles ledger, chain and rail |
+| `migrate` | Applies migrations and creates the services' least-privilege database login |
 
 ## Status
 
-| Milestone | State |
+All seven milestones are built:
+
+| Milestone | Built |
 | --- | --- |
-| Repo scaffold, CI | done |
-| M1 — Ledger core | done |
-| M2 — Payout API + state machine | done |
-| M3 — Events (outbox relay, workers, resolver) | done |
-| M4 — Chains (EVM and Solana deposits) | done |
-| M5 — Noah rail (destinations, signed adapter, webhooks, returns; sandbox run pending a key) | done |
-| M6 — Recon + ops (reconciliation, top-ups, metrics, traces, alerts, dashboard) | done |
-| M7 — AWS (keys in KMS, signed image, Terraform checked in CI; not applied yet) | in progress |
+| M1 Ledger core | Schema enforced by Postgres, posting rules, invariants, a concurrent overspend test |
+| M2 Payouts | State machine, holds, mock rail, HTTP API with API keys and `Idempotency-Key` |
+| M3 Events | Transactional outbox, relay to SQS, idempotent worker, resolver |
+| M4 Chains | EVM (xpub addresses, reorgs) and Solana (seed-derived token accounts) deposits |
+| M5 Noah rail | Encrypted saved bank accounts, ES384-signed adapter, verified webhooks, bank returns |
+| M6 Recon + ops | Reconciliation and breaks, verified treasury top-ups, Prometheus metrics, OpenTelemetry traces, alerts, Grafana dashboard |
+| M7 AWS | Keys in KMS, one signed distroless image, Terraform with offline checks in CI |
 
-What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Customers get their own EVM deposit address, derived from an xpub so Ferry never holds the key. `cmd/watcher` reads USDC transfers to those addresses, shows them as pending, and credits them after N confirmations. It handles reorgs by rewinding and orphaning, and re-checks every block hash before crediting. On Solana, each customer gets a token account at a seed-derived address. The watcher creates it on-chain (signing with a key that can create accounts but cannot move funds), reads only finalized slots, and credits a deposit as soon as it sees it. The treasury sweep out of deposit addresses comes later.
+What hasn't run against the real thing yet:
 
-Payouts go to saved bank accounts (`POST /v1/destinations`), which Ferry stores encrypted and shows only masked. With `FERRY_RAIL=noah`, Ferry is a client of the Noah Business API:
-- It picks the payout channel, prices the payout, and sells against its pre-funded USDC balance, signing every request (ES384).
-- `cmd/worker` runs as its own process.
-- A refusal releases the hold only when Noah definitely created nothing.
+- **The Noah sandbox.** No API key yet; a fake server built from Noah's documented API stands in, and a sandbox contract test is ready.
+- **The AWS stack.** Written and checked, not applied.
 
-There's no Noah sandbox key yet, so this runs against a fake Noah server built from the documented API (`make fake-noah`). `internal/rail/noah/sandbox_test.go` is ready for the real sandbox. The default rail is still the in-memory mock that settles at once.
+Designed but not built: the treasury sweep out of deposit addresses, per-key API scopes, and outbound customer webhooks. See the threat model's residual risk register.
 
-## Container image
+## Quickstart
 
-`make image` builds one distroless, non-root image with every binary (`/ferry/api`, `relay`, `worker`, `watcher`, `recon`, `migrate`); choose one with `--entrypoint`. CI publishes it to `ghcr.io/darkodi/ferry` on every merge to main, signed with cosign and with an SBOM:
+You need Go (the version in `go.mod`), Docker and make.
 
 ```bash
-cosign verify ghcr.io/darkodi/ferry:main \
-  --certificate-identity-regexp 'https://github.com/darkodi/ferry/.github/workflows/ci.yml@refs/heads/main' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+cp .env.example .env
+sed -i "s|^FERRY_ADMIN_KEY=$|FERRY_ADMIN_KEY=$(openssl rand -hex 32)|; s|^FERRY_DATA_KEY=$|FERRY_DATA_KEY=$(openssl rand -base64 32)|" .env
+make up && make migrate   # Postgres, ElasticMQ (SQS), Anvil, a Solana test validator
+make run                  # the API; in dev mode also the relay, worker and resolver, with the mock rail
 ```
 
-## AWS
+Everything binds to 127.0.0.1. If port 5432 is taken, set `POSTGRES_PORT` and the port in `DATABASE_URL` in `.env`.
 
-`deploy/terraform` describes the AWS environment: ECS Fargate services behind an ALB with WAF, RDS Postgres, SQS with a DLQ, KMS keys, Secrets Manager, CloudWatch alarms and X-Ray traces through ADOT sidecars. Every task gets its own IAM role, and only the roles named in each KMS key's policy can use that key. `make tf-check` validates, tests (against a mocked provider), lints and policy-scans it without AWS credentials; CI runs the same. To deploy, see [`deploy/terraform/README.md`](deploy/terraform/README.md) (`make aws-up` / `make aws-down`). The stack has not been applied yet.
+### A deposit and a payout
 
-## Run locally
-
-Requires Go (version in `go.mod`), Docker and make.
+In another terminal, run `make chain-setup` (test USDC on both local chains) and `make watcher` (the EVM deposit watcher). Then:
 
 ```bash
-cp .env.example .env   # adjust if needed
-make up                # Postgres 16 on 127.0.0.1:5432, ElasticMQ (SQS) on :9324, Anvil on :8545, Solana validator on :8899
-make migrate           # apply migrations
-make test              # go test -race ./... (integration tests need Docker; -short skips them)
-make lint              # go vet, golangci-lint, gosec, govulncheck
-make help              # all targets
-```
+source .env; B=http://127.0.0.1:8080/v1
 
-The pinned tool versions are installed into `./bin` on first use.
-
-### Try a payout
-
-Set `FERRY_ADMIN_KEY` (for example `openssl rand -hex 32`) and `FERRY_DATA_KEY` (`openssl rand -base64 32`) in `.env`, and keep `FERRY_ENV=dev`. Then:
-
-```bash
-make up && make migrate   # Postgres, ElasticMQ, a local Anvil chain and a Solana test validator
-make chain-setup          # test USDC on both chains; prints the values to put in .env
-make run                  # API; in dev also the relay, worker and resolver
-make watcher              # in a second terminal: the EVM deposit watcher
-make watcher-solana       # optional, in another terminal: the Solana deposit watcher
-```
-
-`make chain-setup` prints `FERRY_EVM_USDC_ADDRESS` (already in `.env.example`) and, for Solana, `FERRY_SOLANA_USDC_MINT`, `FERRY_SOLANA_AUTHORITY` and `FERRY_SOLANA_DEPOSIT_OWNER`. Copy the Solana values into `.env` and restart `make run`, so new customers also get a Solana address. The Solana keypairs are kept in `.dev/solana` (git-ignored), so the values stay the same after the chain restarts.
-
-In a third terminal:
-
-```bash
-source .env
-B=http://127.0.0.1:8080/v1
-
-# 1. Create a customer (operator). Note the id and the api_key; the key is shown once.
+# 1. A customer (operator call). The api_key is shown once.
 curl -s -X POST $B/customers -H "Authorization: Bearer $FERRY_ADMIN_KEY" -d '{"name":"Acme"}'
 CID=...; KEY=ferry_sk_...
 
-# 2. Fund it on-chain: send 200 TestUSDC from Anvil's first account to the
-#    customer's deposit address. It shows as "pending", then "confirmed" two blocks
-#    (about 4 s) later, when the balance becomes 200.
+# 2. Fund it on-chain: 200 TestUSDC to its deposit address. It shows as pending, then
+#    confirmed two blocks later, and the balance becomes 200.
 curl -s $B/customers/$CID/deposit-addresses -H "Authorization: Bearer $KEY"
-TO=0x...   # the address above
+TO=0x...
 docker compose exec -T anvil cast send --rpc-url http://localhost:8545 --unlocked \
   --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 $FERRY_EVM_USDC_ADDRESS \
   "transfer(address,uint256)" $TO 200000000
 curl -s $B/customers/$CID/deposits -H "Authorization: Bearer $KEY"
-#    Or on Solana: the customer's solana-local address shows "provisioning" until the
-#    watcher has created its token account (one round), then "active". Send to it from the
-#    dev wallet; it is credited once its slot is finalized (about 15 s).
-SOL_TO=...   # the solana-local address above
-docker compose exec -T solana spl-token -u http://localhost:8899 transfer $FERRY_SOLANA_USDC_MINT 200 $SOL_TO
-#    (Without a chain, POST $B/dev/deposits with the operator key still credits directly.)
+#    (No chain? POST $B/dev/deposits {"customer_id":"...","amount":"200"} with the operator key.)
 
-# 3. Save the bank account to pay (a BankAch form, as Noah's channel asks for it). The
-#    response shows only "BankAch ****6789"; the details are stored encrypted.
+# 3. A bank account. The response shows only "BankAch ****6789"; the details are encrypted.
 curl -s -X POST $B/destinations -H "Authorization: Bearer $KEY" -H "Idempotency-Key: dest-1" -d '{
   "country":"US","fiat_currency":"USD","payment_method_type":"BankAch",
   "form":{"AccountHolderAddress":{"Address":"1 Main St","City":"New York","State":"NY","PostalCode":"10001"},
@@ -104,67 +108,109 @@ curl -s -X POST $B/destinations -H "Authorization: Bearer $KEY" -H "Idempotency-
           "PaymentPurpose":"Invoice"}}'
 DID=...
 
-#    Ask for a 100.00 USD payout to it. The quote authorizes up to 101.50 USDC.
+# 4. A 100.00 USD payout. The quote authorizes up to 101.50 USDC.
 curl -s -X POST $B/payouts -H "Authorization: Bearer $KEY" -H "Idempotency-Key: order-1" \
   -d "{\"fiat_amount\":10000,\"fiat_currency\":\"USD\",\"destination_id\":\"$DID\"}"
 PID=...
 
-# 4. Confirm: holds 101.50 and returns "held". The worker then submits it to the mock rail,
-#    which settles at once; a moment later the payout shows "settled".
+# 5. Confirm: 101.50 is held, the worker submits, the mock rail settles.
 curl -s -X POST $B/payouts/$PID/confirm -H "Authorization: Bearer $KEY" -H "Idempotency-Key: confirm-1"
-curl -s $B/payouts/$PID -H "Authorization: Bearer $KEY"
-
-# 5. Balances: 99.50 available (100 paid + 0.50 rail fee; the 1.00 buffer came back).
-curl -s $B/customers/$CID/balances -H "Authorization: Bearer $KEY"
+curl -s $B/payouts/$PID -H "Authorization: Bearer $KEY"              # settled
+curl -s $B/customers/$CID/balances -H "Authorization: Bearer $KEY"   # 99.50: 100 paid + 0.50 fee; the 1.00 buffer came back
 ```
 
-Sending step 3 again with the same `Idempotency-Key` returns the same payout with `Idempotent-Replayed: true`.
+Send step 4 again with the same key, and you get the same payout with `Idempotent-Replayed: true`. On Solana, the customer's `solana-local` address becomes `active` once `make watcher-solana` has created its token account. Copy the Solana values `make chain-setup` printed into `.env` first.
 
-**Reconciliation.** `make recon` runs `cmd/recon` once. It checks the ledger's invariants, every configured chain's deposit addresses, and (with `FERRY_RAIL=noah`) Noah's transactions and balance, and records anything that disagrees as a break. List breaks with `GET /v1/admin/recon-breaks` (operator key); explain one with `POST /v1/admin/recon-breaks/{id}/resolve`. With Noah, book money that arrives in Ferry's Noah balance with `POST /v1/admin/treasury-topups {"rail_tx_id": "..."}`: Ferry reads the amount from Noah. With the fake, `curl -X POST localhost:18090/_control/credit/1000` simulates a top-up arriving.
+### Through the Noah adapter
 
-**Observability.** `make obs-up` starts Prometheus (http://127.0.0.1:9090, with Ferry's alert rules), Grafana (http://127.0.0.1:3000, with the provisioned *Ferry* dashboard) and Jaeger (http://127.0.0.1:16686). Each binary serves `/metrics` on its own loopback port (api 9101, relay 9102, worker 9103, watchers 9104/9105). Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` to send traces: one payout's trace runs from the API's confirm request through the outbox, queue and worker to the Noah HTTP call. Log lines carry `trace_id` to find it.
-
-If port 5432 is taken on your machine, set `POSTGRES_PORT` and the port in `DATABASE_URL` in `.env` to a free one.
-
-### Pay out through Noah (fake or sandbox)
-
-The same flow with the Noah adapter and separate processes. Without a sandbox key, use the fake:
+The same flow with separate processes and the Noah adapter against a local fake built from Noah's documented API:
 
 ```bash
-make fake-noah            # fake Noah on 127.0.0.1:18090
-# in .env: FERRY_RAIL=noah, NOAH_BASE_URL=http://127.0.0.1:18090/v1, NOAH_API_KEY=fake-noah-key,
-#          FERRY_RESOLVER_STALE=5s; leave FERRY_ENV empty so the API runs no in-process worker
-make run                  # API: quotes through Noah
-make relay                # outbox -> queue
-make worker               # submits to Noah; the resolver polls Noah for status
+make fake-noah            # 127.0.0.1:18090
+# .env: FERRY_ENV= (empty), FERRY_RAIL=noah, NOAH_BASE_URL=http://127.0.0.1:18090/v1,
+#       NOAH_API_KEY=fake-noah-key, FERRY_RESOLVER_STALE=5s
+make run; make relay; make worker   # one terminal each
 ```
 
-Fund the customer as above (the dev deposit endpoint needs `FERRY_ENV=dev`; run the API once in dev mode for it), register a destination, create and confirm the payout. It reaches `submitted`. Then settle it at the fake:
+Ferry pays from its pre-funded Noah balance. Fund it first:
+
+1. `curl -X POST localhost:18090/_control/credit/200` at the fake returns a transaction ID.
+2. Book it with `POST /v1/admin/treasury-topups {"rail_tx_id":"<ID>"}`. Ferry reads the amount from Noah.
+
+A confirmed payout then reaches `submitted`. To finish it, call `POST localhost:18090/_control/transactions/<ID>/settle` (or `fail`, or `reverse` for a bank return); the resolver picks it up.
+
+With signed webhooks, the payout settles within a second instead: give the fake `FAKE_NOAH_WEBHOOK_URL` and `FAKE_NOAH_WEBHOOK_KEY`, and give Ferry `NOAH_WEBHOOK_PUBLIC_KEY`. [`docs/demo.md`](docs/demo.md) has the full script.
+
+With a real sandbox key, point `NOAH_BASE_URL` at `https://api.sandbox.noah.com/v1`, and run the contract test first:
 
 ```bash
-curl -s localhost:18090/_control/transactions                # find the transaction ID
-curl -s -X POST localhost:18090/_control/transactions/<ID>/settle  # or fail, review
-```
-
-Within `FERRY_RESOLVER_STALE` the worker re-fetches it and the payout shows `settled`, with 199.50 available from a 300 deposit.
-
-With a sandbox key, point `NOAH_BASE_URL` at `https://api.sandbox.noah.com/v1` and set `NOAH_API_KEY` (and `NOAH_SIGNING_KEY_PATH` if your key requires signing). Then run the contract test first:
-
-```bash
-NOAH_API_KEY=... go test ./internal/rail/noah -run Sandbox -v          # channels + prepare
+NOAH_API_KEY=... go test ./internal/rail/noah -run Sandbox -v                       # channels + prepare
 NOAH_API_KEY=... NOAH_SANDBOX_SELL=1 go test ./internal/rail/noah -run Sandbox -v  # also a 1 USD sale
 ```
 
-**Webhooks.** Noah's webhooks settle payouts without waiting for the resolver. To see it with the fake, give it a webhook signing key and Ferry the public half:
+### Reconciliation
+
+`make recon` runs one reconciliation: ledger invariants, each chain's deposit addresses, and (with `FERRY_RAIL=noah`) Noah's transactions and balance. Anything that disagrees becomes a break:
+
+- list them with `GET /v1/admin/recon-breaks`;
+- explain one with `POST /v1/admin/recon-breaks/{id}/resolve`, which never moves money.
+
+### Observability
+
+`make obs-up` starts three services:
+
+- Prometheus at <http://127.0.0.1:9090>, with Ferry's 18 alert rules;
+- Grafana at <http://127.0.0.1:3000>, with the provisioned *Ferry* dashboard;
+- Jaeger at <http://127.0.0.1:16686>.
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` to export traces. One payout's trace runs from the API's confirm request through the outbox, queue and worker to the Noah HTTP call. Log lines carry `trace_id`.
+
+<!-- Screenshot: Grafana "Ferry" dashboard during docs/demo.md (docs/img/dashboard.png). -->
+
+## On AWS
+
+[`deploy/terraform`](deploy/terraform/README.md) runs Ferry on AWS:
+
+- ECS Fargate services behind an ALB with WAF;
+- RDS Postgres (TLS, verified), SQS with a DLQ;
+- KMS keys, Secrets Manager;
+- CloudWatch alarms to SNS, and X-Ray traces through ADOT sidecars.
+
+Each task has its own IAM role, and each key policy names the exact roles that may use that key.
+
+Deploys run one image built by CI: distroless and non-root, signed keylessly with cosign, with an SBOM, scanned with Trivy. `make aws-up` deploys only the digest whose signature it has verified.
+
+`make tf-check` validates, tests (against a mocked AWS provider), lints and policy-scans the Terraform without credentials, and CI runs the same. The stack has not been applied yet; it costs roughly 100–150 USD a month while running.
 
 ```bash
-openssl ecparam -name secp384r1 -genkey -noout -out /tmp/noah-webhook.pem
-openssl ec -in /tmp/noah-webhook.pem -pubout -out /tmp/noah-webhook.pub.pem
-FAKE_NOAH_WEBHOOK_URL=http://127.0.0.1:8080/v1/webhooks/noah FAKE_NOAH_WEBHOOK_KEY=/tmp/noah-webhook.pem make fake-noah
-# in .env: NOAH_WEBHOOK_PUBLIC_KEY=/tmp/noah-webhook.pub.pem
+cosign verify ghcr.io/darkodi/ferry:main \
+  --certificate-identity-regexp 'https://github.com/darkodi/ferry/.github/workflows/ci.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Settling at the fake now moves the payout to `settled` within a second. `POST localhost:18090/_control/transactions/<ID>/reverse` sends a bank return, and the payout becomes `reversed`. Against the real sandbox, leave `NOAH_WEBHOOK_PUBLIC_KEY` empty (Noah's published key is built in) and expose `/v1/webhooks/noah` through a tunnel such as cloudflared.
+## Development
+
+```bash
+make test       # go test -race ./... (integration tests use Docker; -short skips them)
+make lint       # go vet, golangci-lint (with gosec), govulncheck
+make gitleaks   # secrets in history and working tree
+make tf-check   # Terraform: fmt, validate, test, tflint, checkov
+make image      # the container image, as ferry:local
+make help       # every target
+```
+
+Tools are pinned and installed into `./bin` on first use, or run in containers pinned by digest.
+
+| Path | What's there |
+| --- | --- |
+| `cmd/` | the six binaries |
+| `internal/ledger`, `payout`, `outbox`, `inbox`, `idempotency` | the money core |
+| `internal/chain` (`evm/`, `solana/`), `internal/rail` (`noah/`, `mock/`) | adapters to the outside world |
+| `internal/recon`, `treasury`, `destination`, `customer`, `api` | everything else in the domain |
+| `internal/platform` | db, queue, observability, KMS |
+| `migrations/` | goose SQL, embedded in `migrate` |
+| `deploy/` | Prometheus, Grafana, ElasticMQ, RDS CA bundle, Terraform |
+| `docs/` | design, threat model, self-audit, demo script |
 
 ## License
 

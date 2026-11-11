@@ -37,16 +37,32 @@ func ensureLogin(ctx context.Context, db *sql.DB, name, password string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var powerful, exists bool
+	// An existing role must hold no power of its own: no administrative
+	// attribute, no membership other than ferry_app (on RDS the master
+	// user's power comes from rds_superuser membership, and roles such as
+	// pg_write_all_data bypass the ledger's grants), and no owned objects
+	// (an owner has every right on what it owns). Otherwise resetting its
+	// password would hand that power to every service (SA-005).
+	var exists, attrs, member, owner bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT true, rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls
-		FROM pg_roles WHERE rolname = $1`, name).Scan(&exists, &powerful)
+		SELECT true,
+		       r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls,
+		       EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+		               WHERE m.member = r.oid AND g.rolname <> 'ferry_app'),
+		       EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid)
+		       OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspowner = r.oid)
+		       OR EXISTS (SELECT 1 FROM pg_database d WHERE d.datdba = r.oid)
+		FROM pg_roles r WHERE r.rolname = $1`, name).Scan(&exists, &attrs, &member, &owner)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
 		return fmt.Errorf("look up role %s: %w", name, err)
-	case powerful:
+	case attrs:
 		return fmt.Errorf("role %s has administrative attributes; refusing to use it as the app login", name)
+	case member:
+		return fmt.Errorf("role %s is a member of a role other than ferry_app; refusing to use it as the app login", name)
+	case owner:
+		return fmt.Errorf("role %s owns database objects; refusing to use it as the app login", name)
 	}
 
 	ident := pgx.Identifier{name}.Sanitize()
