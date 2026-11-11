@@ -20,6 +20,9 @@ type Message struct {
 	ID    string
 	Topic string
 	Body  []byte
+	// TraceParent is the W3C trace context of the request that caused the
+	// message ("" for none); it travels as a message attribute.
+	TraceParent string
 }
 
 // Delivery is a received message. Receipt identifies this delivery when

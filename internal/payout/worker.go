@@ -1,6 +1,9 @@
 package payout
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/darkodi/ferry/internal/inbox"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/platform/queue"
 )
 
@@ -98,6 +102,12 @@ func (w *Worker) Handle(ctx context.Context, d queue.Delivery) error {
 	if d.ID == "" {
 		return errors.New("message has no id")
 	}
+	// Continue the trace of the request that wrote the event.
+	ctx, span := obs.Tracer.Start(obs.WithTraceParent(ctx, d.TraceParent), "worker "+d.Topic,
+		trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(attribute.String("message_id", d.ID)))
+	defer span.End()
+	result := "error"
+	defer func() { obs.WorkerMessages.WithLabelValues(d.Topic, result).Inc() }()
 	var ev event
 	if err := json.Unmarshal(d.Body, &ev); err != nil {
 		return fmt.Errorf("decode %s: %w", d.Topic, err)
@@ -111,6 +121,7 @@ func (w *Worker) Handle(ctx context.Context, d queue.Delivery) error {
 		return err
 	}
 	if seen {
+		result = "duplicate"
 		return nil
 	}
 	if consumer == SubmitConsumer {
@@ -134,5 +145,6 @@ func (w *Worker) Handle(ctx context.Context, d queue.Delivery) error {
 	if _, err := inbox.Record(ctx, w.svc.pool, consumer, d.ID); err != nil {
 		return err
 	}
+	result = "ok"
 	return nil
 }

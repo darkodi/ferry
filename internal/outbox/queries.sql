@@ -11,7 +11,7 @@ WHERE id IN (
     LIMIT @max_rows
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, topic, aggregate_id, payload;
+RETURNING id, topic, aggregate_id, payload, traceparent;
 
 -- name: MarkPublished :exec
 UPDATE outbox SET published_at = @published_at::timestamptz, claimed_until = NULL

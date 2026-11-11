@@ -48,10 +48,11 @@ import (
 	"github.com/darkodi/ferry/internal/chain/evm"
 	"github.com/darkodi/ferry/internal/chain/solana"
 	"github.com/darkodi/ferry/internal/ledger"
+	"github.com/darkodi/ferry/internal/platform/obs"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := obs.NewLogger()
 	if err := run(log); err != nil {
 		log.Error("watcher stopped", "error", err)
 		os.Exit(1)
@@ -74,6 +75,14 @@ func run(log *slog.Logger) error {
 	// Cancelled on Ctrl-C or SIGTERM: the current round finishes first.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTraces, err := obs.Setup(ctx, "ferry-watcher")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = shutdownTraces(context.Background()) }()
+	if err := obs.Serve(ctx, envOr("FERRY_METRICS_ADDR", map[string]string{"evm": "127.0.0.1:9104", "solana": "127.0.0.1:9105"}[os.Getenv("FERRY_CHAIN")]), log); err != nil {
+		return err
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {

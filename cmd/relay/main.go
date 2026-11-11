@@ -23,11 +23,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/darkodi/ferry/internal/outbox"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/platform/queue"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := obs.NewLogger()
 	if err := run(log); err != nil {
 		log.Error("relay stopped", "error", err)
 		os.Exit(1)
@@ -43,6 +44,14 @@ func run(log *slog.Logger) error {
 	// Cancelled on Ctrl-C or SIGTERM: the current round finishes, then Run returns.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTraces, err := obs.Setup(ctx, "ferry-relay")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = shutdownTraces(context.Background()) }()
+	if err := obs.Serve(ctx, envOr("FERRY_METRICS_ADDR", "127.0.0.1:9102"), log); err != nil {
+		return err
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -58,4 +67,11 @@ func run(log *slog.Logger) error {
 	outbox.NewRelay(pool, q, time.Now, log).Run(ctx, 500*time.Millisecond)
 	log.Info("relay stopped")
 	return nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

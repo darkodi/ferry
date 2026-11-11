@@ -39,12 +39,13 @@ import (
 	"github.com/darkodi/ferry/internal/chain/evm"
 	"github.com/darkodi/ferry/internal/chain/solana"
 	"github.com/darkodi/ferry/internal/ledger"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/rail/noah"
 	"github.com/darkodi/ferry/internal/recon"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := obs.NewLogger()
 	if err := run(log); err != nil {
 		log.Error("recon stopped", "error", err)
 		os.Exit(1)
@@ -63,6 +64,11 @@ func run(log *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTraces, err := obs.Setup(ctx, "ferry-recon")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = shutdownTraces(context.Background()) }()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)

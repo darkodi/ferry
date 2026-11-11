@@ -6,6 +6,8 @@
 //	DATABASE_URL         Postgres connection string (required)
 //	FERRY_SQS_QUEUE_URL  queue to read from (required)
 //	FERRY_SQS_ENDPOINT   SQS endpoint override, e.g. ElasticMQ locally
+//	FERRY_SQS_DLQ_URL    the dead-letter queue, for the ferry_queue_messages gauge
+//	FERRY_METRICS_ADDR   Prometheus /metrics listener (default 127.0.0.1:9103; "off" disables)
 //	FERRY_RAIL           which rail to submit to: "noah" (see internal/rail/noah.FromEnv for NOAH_*)
 //	FERRY_RESOLVER_STALE how long a payout may sit held or submitted before the
 //	                     resolver re-drives it (default 1m); without a public webhook
@@ -34,13 +36,14 @@ import (
 	"github.com/darkodi/ferry/internal/destination"
 	"github.com/darkodi/ferry/internal/ledger"
 	"github.com/darkodi/ferry/internal/payout"
+	"github.com/darkodi/ferry/internal/platform/obs"
 	"github.com/darkodi/ferry/internal/platform/queue"
 	"github.com/darkodi/ferry/internal/rail"
 	"github.com/darkodi/ferry/internal/rail/noah"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := obs.NewLogger()
 	if err := run(log); err != nil {
 		log.Error("worker stopped", "error", err)
 		os.Exit(1)
@@ -60,6 +63,14 @@ func run(log *slog.Logger) error {
 	// Cancelled on Ctrl-C or SIGTERM: the current batch finishes first.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTraces, err := obs.Setup(ctx, "ferry-worker")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = shutdownTraces(context.Background()) }()
+	if err := obs.Serve(ctx, envOr("FERRY_METRICS_ADDR", "127.0.0.1:9103"), log); err != nil {
+		return err
+	}
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -79,7 +90,12 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	svc := payout.NewService(pool, rl, dests, house, time.Now)
+	svc := payout.NewService(pool, obs.InstrumentRail(rl), dests, house, time.Now)
+	queues := map[string]obs.QueueDepth{"payouts": func(ctx context.Context) (int64, error) { return q.Depth(ctx, "") }}
+	if dlq := os.Getenv("FERRY_SQS_DLQ_URL"); dlq != "" {
+		queues["payouts-dlq"] = func(ctx context.Context) (int64, error) { return q.Depth(ctx, dlq) }
+	}
+	obs.Registry.MustRegister(obs.NewQueueCollector(queues))
 	resolver := payout.NewResolver(svc, log)
 	if v := os.Getenv("FERRY_RESOLVER_STALE"); v != "" {
 		if resolver.StaleAfter, err = time.ParseDuration(v); err != nil || resolver.StaleAfter <= 0 {
@@ -109,4 +125,11 @@ func railFromEnv(name string) (rail.Rail, error) {
 	default:
 		return nil, fmt.Errorf("unknown FERRY_RAIL %q", name)
 	}
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

@@ -123,6 +123,7 @@ type Outbox struct {
 	CreatedAt    time.Time
 	PublishedAt  *time.Time
 	ClaimedUntil *time.Time
+	Traceparent  *string
 }
 
 type Payout struct {
