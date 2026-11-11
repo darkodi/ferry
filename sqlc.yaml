@@ -88,3 +88,12 @@ sql:
         out: internal/destination/destinationdb
         sql_package: pgx/v5
         overrides: *overrides
+  - engine: postgresql
+    schema: migrations
+    queries: internal/recon/queries.sql
+    gen:
+      go:
+        package: recondb
+        out: internal/recon/recondb
+        sql_package: pgx/v5
+        overrides: *overrides

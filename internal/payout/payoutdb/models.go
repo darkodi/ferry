@@ -187,3 +187,36 @@ type RailTransaction struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
+
+type ReconBreak struct {
+	ID             uuid.UUID
+	CheckName      string
+	Kind           string
+	Subject        string
+	Detail         []byte
+	FirstSeen      time.Time
+	LastSeen       time.Time
+	SeenCount      int32
+	LastRunID      int64
+	ClearedAt      *time.Time
+	ResolvedAt     *time.Time
+	ResolvedReason *string
+}
+
+type ReconMatch struct {
+	RunID       int64
+	CheckName   string
+	FerryRef    string
+	ExternalRef string
+}
+
+type ReconRun struct {
+	ID         int64
+	StartedAt  time.Time
+	FinishedAt *time.Time
+	WindowFrom time.Time
+	WindowTo   time.Time
+	Checks     []string
+	Failed     []string
+	BreaksSeen int32
+}

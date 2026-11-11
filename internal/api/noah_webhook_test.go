@@ -30,6 +30,7 @@ import (
 	"github.com/darkodi/ferry/internal/platform/queue"
 	"github.com/darkodi/ferry/internal/rail/noah"
 	"github.com/darkodi/ferry/internal/rail/noah/noahtest"
+	"github.com/darkodi/ferry/internal/treasury"
 )
 
 type noahAPI struct {
@@ -98,6 +99,7 @@ func newNoahAPI(t *testing.T, funds string) (*noahAPI, string) {
 		srv: httptest.NewServer(api.New(api.Config{
 			Pool: pool, Payouts: svc, Destinations: dests, Idem: idem, House: house,
 			AdminKey: adminKey, Dev: true, RailWebhooks: hooks, Log: log,
+			Treasury: treasury.New(pool, "noah", rl, noahtest.Crypto, house),
 		})),
 	}
 	t.Cleanup(n.srv.Close)

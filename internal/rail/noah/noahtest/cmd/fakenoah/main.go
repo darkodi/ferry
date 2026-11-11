@@ -13,7 +13,8 @@
 // Point Ferry at it with NOAH_BASE_URL=http://127.0.0.1:18090/v1. Drive
 // transactions with:
 //
-//	curl -X POST localhost:18090/_control/transactions/<id>/settle   (or fail, review)
+//	curl -X POST localhost:18090/_control/transactions/<id>/settle   (or fail, review, reverse)
+//	curl -X POST localhost:18090/_control/credit/1000                (a treasury top-up arriving)
 //	curl localhost:18090/_control/transactions
 package main
 

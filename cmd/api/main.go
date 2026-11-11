@@ -47,6 +47,7 @@ import (
 	"github.com/darkodi/ferry/internal/rail"
 	"github.com/darkodi/ferry/internal/rail/mock"
 	"github.com/darkodi/ferry/internal/rail/noah"
+	"github.com/darkodi/ferry/internal/treasury"
 )
 
 func main() {
@@ -118,10 +119,12 @@ func run(log *slog.Logger) error {
 	}
 
 	var hooks api.RailWebhooks
-	if rl.Name() == "noah" {
+	var treasurySvc *treasury.Service
+	if nr, ok := rl.(*noah.Rail); ok {
 		if hooks, err = noah.WebhooksFromEnv(os.Getenv); err != nil {
 			return err
 		}
+		treasurySvc = treasury.New(pool, nr.Name(), nr, nr.Currency(), house)
 	}
 
 	addresses, err := depositAddresses(ctx, pool, log)
@@ -139,6 +142,7 @@ func run(log *slog.Logger) error {
 		AdminKey:     adminKey,
 		Dev:          dev,
 		RailWebhooks: hooks,
+		Treasury:     treasurySvc,
 		Log:          log,
 	})
 	srv := &http.Server{

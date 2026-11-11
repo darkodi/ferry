@@ -420,4 +420,14 @@ func TestDepositCreditedOnce(t *testing.T) {
 		t.Fatalf("%d deposit entries, want 1", n)
 	}
 	wantAvailable(t, cust, "200")
+
+	// Reconciliation reads the same balance from the chain (finalized);
+	// an address whose account was never created holds nothing.
+	bal := solana.NewBalances(c.name, c.client)
+	if got, err := bal.Balance(t.Context(), addr.Address, 0); err != nil || got != ledger.Amount(usdc(200)) {
+		t.Fatalf("reconciliation balance %s, %v; want 200", got, err)
+	}
+	if got, err := bal.Balance(t.Context(), newKey(t).PublicKey().String(), 0); err != nil || got != 0 {
+		t.Fatalf("balance of a missing account %s, %v; want 0", got, err)
+	}
 }
