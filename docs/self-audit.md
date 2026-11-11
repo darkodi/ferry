@@ -8,3 +8,21 @@ Security issues found in Ferry's own code, recorded before or with the fix.
 | SA-002 | Low | Dependencies | `govulncheck` flagged GO-2026-6278 (WebSocket mask key from a weak PRNG) in `github.com/gorilla/websocket` v1.5.0, required by `go-ethereum`'s RPC client. Ferry dials the EVM node over HTTP, so the WebSocket path is reachable only with a `ws://` RPC URL, but the fix is a patch release. Bumped to v1.5.3. | Fixed | M4 `m4/evm-deposits` |
 | SA-003 | Low | Chain watcher | `Watcher.confirm` compared a deposit's stored block hash with the chain's using `strings.EqualFold`. That is harmless for EVM hex hashes, but Solana blockhashes are base58, where case is significant: two different hashes differing only in letter case would compare equal, so a replaced block could pass the re-check before crediting. Producing such a pair is not practical, but the comparison was wrong for the data. Now an exact comparison. | Fixed | M4 `m4/solana-deposits` |
 | SA-004 | Medium | Toolchain | `govulncheck` flagged GO-2026-6859 (HTTP/1 server crash from a `MaxBytesReader` header race in `net/http`), published 2026-11-11 and reachable through the public API, which bounds request bodies with `MaxBytesReader`. Fixed by moving the toolchain to Go 1.27.4 (released 2026-11-02). That release is younger than the two-week age rule Ferry applies to dependencies; the exception is deliberate, because it is the Go team's own security patch for a reachable crash. CI follows `go.mod`. | Fixed | M6 `m6/recon` |
+| SA-005 | Low | Deploy (`cmd/migrate`) | `migrate -app-login` refused an existing role only if it had an administrative attribute (superuser, createrole, createdb, replication, bypassrls). A role could still carry power through **membership** (on RDS the master user's power comes from `rds_superuser`; `pg_write_all_data` bypasses the ledger's append-only grants) or **ownership** (an owner has every right on its tables). Naming such a role by mistake would reset its password and hand that power to every service. Never deployed. Now the role must also be a member of nothing but `ferry_app` and own no relation, schema or database. `TestEnsureLogin` covers both cases. | Fixed | M7 `m7/polish` |
+
+## Final review (M7)
+
+Before calling v1 done, the security-relevant code added in M5–M7 was read again against the threat model:
+- KMS signers (spec and usage checks, signature verification, DER parsing);
+- the data-key unwrap;
+- `migrate -app-login`;
+- the webhook path;
+- `/healthz`;
+- the Terraform IAM and key policies;
+- the deploy script.
+
+That review produced SA-005. Everything else it checked either matched the threat model or is listed in its residual risk register as accepted or later work. Automated gates on every PR:
+- `go vet`, golangci-lint with gosec, govulncheck, gitleaks;
+- race-enabled tests, with fuzz tests for amounts, webhook payloads and DER signatures;
+- Trivy on the image;
+- terraform test, tflint and checkov on the infrastructure.

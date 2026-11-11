@@ -21,9 +21,17 @@
 - FX engine. Quotes come from the rail; Ferry only stores and enforces them.
 - High availability across regions. One region, horizontally scalable workers.
 
+### Status (end of M7)
+
+All seven milestones are built. Each section below describes the design and then, under "As built", what the code actually does. Where the two differ, "As built" wins.
+- **Never exercised:** the real Noah sandbox (no API key yet; a fake built from the docs stands in) and the AWS deployment (written and checked offline, not applied).
+- **Designed but not built:** the treasury sweep, per-key API scopes and rate limits, outbound customer webhooks, the money controls in Security, and the OpenAPI spec.
+
+The decisions made along the way are collected in the Decision log near the end.
+
 ## Architecture
 
-Five Go binaries share one Postgres database; nothing talks to the outside world inside a transaction.
+Five long-running Go binaries share one Postgres database, plus `migrate`, a one-off; nothing talks to the outside world inside a transaction.
 
 ```mermaid
 flowchart TB
@@ -52,6 +60,7 @@ Recon is the daily checker. It reads what Ferry has recorded in Postgres and com
 | `relay` | Outbox → SQS | 1–2 replicas, `SKIP LOCKED` |
 | `watcher` | One per chain; deposit detection, confirmations, reorgs | One active per chain (leader lock in Postgres) |
 | `recon` | Daily reconciliation, invariant checks | Scheduled task |
+| `migrate` | Applies migrations; creates the services' database login | One-off task before a deploy |
 
 ## Domain model
 
@@ -668,10 +677,10 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 
 ### Security
 
-- **Inbound API:** API keys hashed at rest, per-key scopes, rate limits; outbound customer webhooks signed (HMAC with timestamp) to block replays.
+- **Inbound API:** API keys hashed at rest, per-key scopes, rate limits; outbound customer webhooks signed (HMAC with timestamp) to block replays. *Built: hashed keys, constant-time admin key, `Idempotency-Key`, and WAF per-IP rate limits on AWS. Not built: per-key scopes and limits, outbound customer webhooks.*
 - **Inbound rail webhooks:** verify the ECDSA/SHA-384 `Webhook-Signature` with the rail's public key for that environment; optionally allowlist the rail's IPs. Treat a verified event as a hint: re-fetch the transaction from the rail before moving money.
 - **Outbound rail calls:** request signing (ES384 JWT) on from day one, even though the sandbox does not require it.
-- **Money controls:** per-customer limits and velocity checks, an allowlist of sweep destinations, two-person approval for manual ledger adjustments, and an append-only audit log of every admin action.
+- **Money controls:** per-customer limits and velocity checks, an allowlist of sweep destinations, two-person approval for manual ledger adjustments, and an append-only audit log of every admin action. *Not built in v1: the ledger's own guarantees (no overdraft, append-only, invariants) are in place, but these business controls are later work (threat model, residual risk register).*
 - **Ledger integrity:** append-only journal and a least-privilege app role (see Ledger); the invariant job checks every balance against the postings.
 - **Keys and infrastructure:** least-privilege IAM per ECS service; signing keys never leave KMS; secrets in Secrets Manager.
 
@@ -686,7 +695,7 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 Each signer reads its key's public key when it starts (wrong key id, spec or usage fails then, not at the first payout) and verifies every signature KMS returns before using it.
 
 **Container image.** One distroless, non-root image holds every binary (`/ferry/api`, `relay`, `worker`, `watcher`, `recon`, `migrate`). Base images are pinned by digest, and the image runs with a read-only root filesystem. CI builds it on every pull request, smoke-tests each binary and scans it with Trivy (failing on fixable HIGH or CRITICAL findings). On `main` CI pushes it to `ghcr.io/darkodi/ferry` with an SBOM and build provenance, and signs it keylessly with cosign. `cmd/migrate` applies the embedded migrations as a one-off task.
-- **Code hygiene:** Go fuzz tests on amount parsing and webhook decoding; `gosec`, `govulncheck`, `gitleaks` in CI.
+- **Code hygiene:** Go fuzz tests on amount parsing, webhook decoding and KMS DER signatures; `gosec`, `govulncheck`, `gitleaks` in CI; Trivy on the image; tflint and checkov on the infrastructure.
 - **Documents:** `docs/threat-model.md` (STRIDE per component and trust boundary) and `docs/self-audit.md` (findings, severity, fix PRs) — the auditor's view of your own system.
 
 ## API, repo layout, milestones
@@ -704,54 +713,98 @@ Each signer reads its key's public key when it starts (wrong key id, spec or usa
 | POST | `/v1/payouts` | Create + quote to a `destination_id`; requires `Idempotency-Key` |
 | POST | `/v1/payouts/{id}/confirm` | Places hold, enqueues submit |
 | GET | `/v1/payouts/{id}` | State, quote, timeline of transitions |
-| GET | `/v1/ledger/entries?account_id=` | Paginated postings (cursor-based) |
+| GET | `/v1/ledger/entries?account_id=` | Paginated postings (cursor-based). *Not built in v1* |
 | POST | `/v1/admin/treasury-topups` | Operator only. Book a top-up from the rail transaction id; the amount comes from the rail |
 | GET | `/v1/admin/recon-breaks` | Operator only. Live reconciliation breaks (`?resolved=true` includes resolved ones) |
 | POST | `/v1/admin/recon-breaks/{id}/resolve` | Operator only. Record why a break is acceptable; moves no money |
 | POST | `/v1/webhooks/{rail}` | Inbound rail events (`noah`): signature-verified, stored, then a re-fetch is queued |
+| GET | `/healthz` | Load balancer health: 200 while the database answers, else 503; not logged |
 
-Publish it as an OpenAPI spec; generate the server stubs with `oapi-codegen`.
+Publish it as an OpenAPI spec; generate the server stubs with `oapi-codegen`. *Not done in v1: the routes are written by hand with `chi` and documented here and in the README; the spec is later work.*
 
 ### Repo layout
 
+As built:
+
 ```text
 ferry/
-  cmd/            api, worker, relay, watcher, recon
+  cmd/              api, relay, worker, watcher (evm or solana), recon, migrate
   internal/
-    ledger/       entries, postings, balances, invariants
-    customer/     customers and API keys
-    payout/       state machine, service, resolver
-    chain/        adapter interface, evm/, solana/
-    rail/         adapter interface, noah/, mock/
-    outbox/       writer, relay
-    idempotency/
-    recon/
-    platform/     db, config, telemetry, queue
-  migrations/     goose SQL migrations
-  api/openapi.yaml
-  deploy/terraform/
-  docs/           design.md, threat-model.md, runbook.md
-  test/           integration, fault-injection, property
+    ledger/         entries, postings, balances, posting rules, invariants
+    customer/       customers and API keys
+    destination/    saved bank accounts, encrypted at rest
+    payout/         state machine, service, worker, resolver
+    chain/          deposit addresses and watcher; evm/, solana/
+    rail/           Rail interface; noah/ (adapter, signer, webhooks, noahtest fake), mock/
+    outbox/ inbox/  transactional outbox and relay; consumer dedup
+    idempotency/    Idempotency-Key store
+    recon/          reconciliation checks and breaks
+    treasury/       verified treasury top-ups
+    api/            HTTP handlers (chi)
+    platform/       db, queue (SQS), obs (metrics, traces, logs), awskms
+    testutil/       pgtest (Postgres in Docker), soltest (Solana validator)
+  migrations/       goose SQL migrations, embedded in cmd/migrate
+  test/             integration and property tests
+  contracts/        TestUSDC for the local EVM chain
+  deploy/           elasticmq.conf, prometheus/, grafana/, rds/ (CA bundle), terraform/
+  docs/             design.md, threat-model.md, self-audit.md, demo.md
+  Dockerfile        one distroless image with every binary
 ```
 
 Libraries: `pgx` + `sqlc` (no ORM), `chi`, `go-ethereum`, `solana-go`, `testcontainers-go`, `rapid`, `slog`, OpenTelemetry SDK.
 
 ### Milestones
 
-1. **M1 — Ledger core.** Schema, posting rules, invariants, concurrency tests.
-2. **M2 — Payout API + state machine.** Idempotency, holds, mock rail, failure paths.
+1. **M1 — Ledger core.** Schema, posting rules, invariants, concurrency tests. *(done)*
+2. **M2 — Payout API + state machine.** Idempotency, holds, mock rail, failure paths. *(done)*
 3. **M3 — Events.** Outbox, relay, idempotent consumers, resolver. *(done)*
 4. **M4 — Chains.** EVM + Solana watchers, confirmations, reorg test. *(done; the treasury sweep is deferred, see Blockchain integration)*
 5. **M5 — Noah sandbox rail.** Real quote/submit/webhook against the sandbox. *(done: destinations, signed adapter, standalone worker, verified webhooks and returns; the real sandbox is still to be run once a key exists)*
 6. **M6 — Recon + ops.** Reconciliation job, metrics, traces, dashboard. *(done: reconciliation, treasury top-ups, metrics, traces, alerts, dashboard)*
-7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video.
+7. **M7 — AWS + polish.** Terraform deploy, CI, README, design doc, demo video. *(done: every key in KMS, one signed image, Terraform checked offline in CI, docs; the stack is not applied yet, and the video is recorded from `docs/demo.md`)*
 
 ### Open questions
 
 - ~~Which EVM testnet has a usable USDC faucet?~~ Decided in M4: the chain is configuration (`FERRY_EVM_CHAIN`, RPC URL, USDC address). Both Ethereum Sepolia and Base Sepolia have Circle's test USDC; docs use Sepolia.
-- Does the Noah sandbox send webhooks to a public URL, or is polling needed locally (use a tunnel such as ngrok)?
+- **Carried:** does the Noah sandbox send webhooks to a public URL? Ferry works either way: the resolver polls (`FERRY_RESOLVER_STALE`), and webhooks only make it faster. To be checked once a sandbox key exists, with a tunnel such as cloudflared locally or the ALB on AWS.
 - ~~SQS vs NATS for the local default~~ Decided in M3: SQS everywhere, with ElasticMQ standing in locally, so there is one queue adapter and the DLQ behaves the same in dev and on AWS.
-- **Treasury top-up:** when and how USDC moves from the omnibus wallet to Noah (the `treasury_topup` entry); manual in v1 until M4.
+- ~~**Treasury top-up**~~ Decided in M6: the operator moves USDC to Noah by hand, then books it with `POST /v1/admin/treasury-topups {rail_tx_id}`. Ferry reads the amount from Noah and books each transaction once. Automating the move needs the treasury sweep (**carried**).
+- **Carried:** a second rail. The `Rail` interface keeps Noah's details inside `internal/rail/noah`. Fireblocks was looked at in M7: it is mainly custody (vaults, policies) and reaches fiat through partner providers. It fits better as a future custody layer for the sweep than as a replacement for Noah.
+
+## Decision log
+
+Decisions in the order they were made. Each one is explained in its section above.
+
+| When | Decision | Why |
+| --- | --- | --- |
+| M1 | Money as integers in minor units (USDC 6 decimals), exact decimal parsing; no floats | Rounding errors are lost money |
+| M1 | Three ledger tables, five account kinds, seven entry types; append-only, corrections as new entries | The smallest ledger that explains every flow; history can't be rewritten |
+| M1 | The database enforces balance, no overdraft and append-only, and the app role can't `UPDATE`/`DELETE` history | A bug in Go can't corrupt the ledger |
+| M1 | Lock balance rows in ascending account id | No deadlocks between concurrent entries |
+| M2 | Explicit payout state machine with versioned compare-and-set transitions; `settled` is not terminal | Losing a race is visible and safe; bank returns come later |
+| M2 | Hold the rail's authorized maximum, settle the actual amount, release the rest | Price moves between quote and settle can't overdraw a customer |
+| M2 | `Idempotency-Key` on every mutating endpoint: same key and body replays, different body 422, in flight 409 | Client retries never create a second payout |
+| M2 | Rail Nonce persisted before the call and reused on retry; a new Nonce only after a confirmed failure | A timeout can't cause a second payout at the rail |
+| M3 | Transactional outbox and consumer inbox | Write first, act second; at-least-once delivery without duplicates |
+| M3 | SQS everywhere, ElasticMQ locally | One queue adapter; the DLQ behaves the same in dev and on AWS |
+| M3 | A resolver re-drives unknown outcomes | Crashes and lost webhooks end in a known state |
+| M4 | Deposits on both chains now, sweep later | Detection is the hard part; the sweep needs signing, gas and nonces |
+| M4 | EVM addresses from an xpub; Solana token accounts at seed-derived addresses created by a low-power authority | The API holds no key that can move customer funds |
+| M4 | The chain is configuration (name, RPC, USDC address) | Any EVM testnet with test USDC works |
+| M5 | Saved destinations, encrypted at rest; channel chosen at quote time | Bank details are entered once and never shown again |
+| M5 | First-party payouts from Ferry's own Noah balance | One KYB; mapping customers to Noah customers is later work |
+| M5 | Built against a fake Noah from the docs; sandbox contract test skipped until a key exists | Progress without a key, honest about what is unverified |
+| M5 | Ferry sets its own quote TTL; status version is a progress rank; reversals found via `Reverses` | What the Noah docs actually say |
+| M5 | Webhooks verified, stored, then trigger a re-fetch; they never move money themselves | Webhooks are untrusted and unordered |
+| M6 | Breaks are resolved with a reason only; ledger fixes stay separate corrections | Reconciliation never edits money |
+| M6 | Treasury top-ups booked from a verified rail transaction | The operator can't type an amount |
+| M6 | Prometheus, OpenTelemetry (OTLP), Jaeger locally; traceparent through outbox and SQS | One trace per payout across processes |
+| M7 | Terraform written and checked in CI, not applied | Reviewable without an AWS bill |
+| M7 | Every private key in KMS (P-384 Noah, Ed25519 Solana, wrapped data key); admins may manage but not use | Keys can't be copied; use is limited to named roles |
+| M7 | One distroless image, signed keylessly, deployed only by verified digest | Supply chain: what CI built is what runs |
+| M7 | ADOT sidecars to CloudWatch and X-Ray; alarms to SNS | Same metrics and alerts as locally, no Prometheus to run |
+| M7 | Terraform never writes secret values; the deploy script fills them | No secret in Terraform state |
+| M7 | Services log in as `ferry_svc` (member of `ferry_app` only), verifying the RDS certificate | Least privilege and no impostor database |
 
 ## Evolution
 

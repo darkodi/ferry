@@ -49,7 +49,7 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 - **`posted` can drift from the postings.** `ferry_app` can set `posted` to any non-negative value without a matching entry. The Go ledger updates it only inside `PostEntry`, and `ledger.CheckInvariants` (posted = Σ postings) detects drift (`TestInvariantsDetectDrift`). A database-level trigger tying `posted` to postings was rejected for v1 to keep the schema simple.
 - **Double posting under a different key.** The database cannot tell that two entries with different `idempotency_key`s describe the same event. Deterministic keys built by `internal/ledger/rules.go` make this a code-review concern.
-- **Owner and superuser are trusted.** They can drop the triggers. This is accepted: they run migrations only, and their use belongs in an audit log (M7).
+- **Owner and superuser are trusted.** They can drop the triggers. This is accepted: they run migrations only. On AWS the owner's password is managed by RDS and readable only by the `migrate` task, and RDS logs every connection; a full audit log of owner sessions is later work.
 
 ## Payouts and the rail adapter (M2)
 
@@ -81,7 +81,7 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 ### Residual risks
 
 - ~~**`needs_resolution` needs a resolver.**~~ Resolved in M3: `payout.Resolver` resubmits stale `held` payouts with the stored nonce and re-fetches stale `submitted` ones.
-- **Rail mismatch is not alerted yet.** `ErrRailMismatch` is returned and logged; the alert arrives with metrics in M6.
+- ~~**Rail mismatch is not alerted yet.**~~ Closed in M6: `ferry_rail_mismatch_total` and the `FerryRailMismatch` alert (a CloudWatch alarm on AWS).
 - **`accounts.owner_id` is not a foreign key to `customers`**, so the database alone does not stop accounts for unknown owners. `customer.Create` opens accounts in the same transaction as the customer row.
 
 ## Public API (M2)
@@ -109,8 +109,8 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 ### Residual risks
 
-- **No rate limiting or key rotation yet.** Rate limits and per-key scopes are planned for M7; a leaked key stays valid until `revoked_at` is set by hand.
-- **Operator key is a single shared secret.** Acceptable for a portfolio deployment; a real one would use per-operator credentials and an audit log (M7).
+- **No per-key rate limits, scopes or rotation.** On AWS, WAF limits requests per client IP (M7). Per-key limits and scopes are later work, and a leaked key stays valid until `revoked_at` is set by hand.
+- **Operator key is a single shared secret.** Accepted for a portfolio deployment. On AWS it is generated into Secrets Manager and never typed by hand; a real deployment would use per-operator credentials and an audit log of admin actions.
 - **Customer creation is not idempotent.** It is an operator action; a retried call creates a second customer with a new key.
 
 ## Outbox relay and queue (M3)
@@ -137,8 +137,8 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 ### Residual risks
 
-- **Messages are not signed.** Anyone with queue access can inject or replay messages; they cannot move money a customer did not confirm, but they can trigger extra work. IAM-scoped queues (M7) are the control.
-- **No alert on the DLQ or outbox lag yet.** Metrics and alerts arrive in M6.
+- **Messages are not signed.** Anyone with queue access can inject or replay messages; they cannot move money a customer did not confirm, but they can trigger extra work. On AWS (M7) only the relay's task role may send and only the worker's may receive, and the queue refuses non-TLS requests.
+- ~~**No alert on the DLQ or outbox lag yet.**~~ Closed in M6 (`FerryDLQNotEmpty`, `FerryOutboxLag`), and as CloudWatch alarms on AWS (M7).
 - **Published outbox rows and inbox rows are never pruned.** Archiving or partitioning by time is on the Evolution list.
 
 ## Payout worker and resolver (M3)
@@ -162,9 +162,9 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 ### Residual risks
 
-- **No SLA alert yet.** A payout stuck in review for days is re-fetched but nobody is paged; the alert on `submitted` beyond SLA comes with metrics in M6.
+- ~~**No SLA alert yet.**~~ Closed in M6: `FerryPayoutSubmittedPastSLA` (26 h, excluding payouts in review) and `FerryPayoutHeldStuck`.
 - **Resolver polls every stale `submitted` payout each round.** Fine at portfolio scale; at volume it needs backoff per payout (e.g. a `next_sync_at` column).
-- **Dev mode runs everything in the API process.** A crash of the API stops the worker too. Separate binaries are used once the rail is shared (M5).
+- ~~**Dev mode runs everything in the API process.**~~ Closed in M5: with `FERRY_RAIL=noah` the worker runs as its own process, and on AWS as its own service. Dev mode keeps the single process for convenience.
 
 ## Chain watchers (M4)
 
@@ -192,8 +192,8 @@ Later milestones add the public API, inbound rail webhooks, chain RPC and the qu
 
 ### Residual risks
 
-- **Deep reorgs are only logged.** A reorg deeper than the confirmation depth that removes a credited deposit needs a human `correction`, and there is no alert until M6. Keep confirmations conservative on testnet (12 by default).
-- **A single RPC provider.** The watcher trusts one node for liveness. Cross-checking several providers, or reconciliation against them (M6), would catch a node that consistently lies.
+- **Deep reorgs are only logged.** A reorg deeper than the confirmation depth that removes a credited deposit needs a human `correction`. Since M6 it alerts (`FerryCreditedDepositReorged`, `FerryDeepReorg`, and CloudWatch alarms on AWS); the correction itself stays manual by design. Keep confirmations conservative on testnet (12 by default).
+- **A single RPC provider.** The watcher trusts one node for liveness. Reconciliation (M6) re-reads balances, but from the same provider; cross-checking several providers would catch a node that consistently lies. Accepted for testnet.
 - **The topic filter lists every deposit address.** That is fine at portfolio scale; at volume, filter only by contract and match locally, or use a log indexer.
 - **Dust deposits are credited.** Without a minimum deposit, spam creates rows and tiny credits; a minimum and a sweep threshold come with the sweep.
 - **Funds in deposit addresses are not swept yet.** They are recorded under `chain_omnibus`, but moving them needs the sweep (deferred).
@@ -301,10 +301,10 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 
 ### Residual risks
 
-- **No rate limit or IP allowlist yet.** Noah publishes webhook IPs; an allowlist at the load balancer (M7) would cut the noise before the signature check.
-- **A large reversal amount stops for a human.** Noah reports a reversal at the market rate, which may exceed what was spent; Ferry then logs `ErrRailMismatch` and leaves the payout `settled`. The alert arrives with M6.
+- **No IP allowlist.** On AWS (M7) WAF rate-limits the webhook path like any other. Noah publishes its webhook IPs, and an allowlist rule would cut noise before the signature check; it is left out because the signature is the authentication and the IP list can change.
+- **A large reversal amount stops for a human.** Noah reports a reversal at the market rate, which may exceed what was spent; Ferry then logs `ErrRailMismatch` and leaves the payout `settled`. Since M6 that pages (`FerryRailMismatch`).
 - **The step after a reversal is unverified.** For pre-funded payouts, it's not yet known whether Noah's follow-up on-chain `AdjustmentFor` transaction ever moves Ferry's balance. Until the sandbox shows it, such transactions are stored, not applied.
-- **Return lookup is bounded** to 10 pages of transactions after the sale. A return Noah books much later and buried under heavy traffic would be missed until reconciliation (M6).
+- **Return lookup is bounded** to 10 pages of transactions after the sale. A return Noah books much later and buried under heavy traffic would be missed until reconciliation, whose rail check (M6) reports it as a reversal not booked.
 
 ## Reconciliation and treasury (M6)
 
@@ -333,7 +333,7 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 
 ### Residual risks
 
-- **No alerting yet.** Breaks are visible in the admin API and logs; the alert for breaks older than 24 hours arrives with metrics (M6 PR 2).
+- ~~**No alerting yet.**~~ Closed in M6: `FerryInvariantViolation`, `FerryReconBreakOld` and `FerryReconNotRunning` (the invariant and recon alarms on AWS).
 - **Chain checks scale with addresses.** One `balanceOf` (or token-balance) call per deposit address per run is fine at portfolio scale; at volume, use Multicall or an indexer.
 - **Solana is read "now".** A deposit finalized but not yet scanned shows as an `address_balance` break that the next run clears.
 - **Deposits before the watcher started** sit on-chain without a deposit row, so they remain `address_balance` breaks until a person resolves or corrects them. That's by design: Ferry never credits money it did not see arrive.
@@ -361,7 +361,7 @@ Metrics endpoints, trace export (OTLP) and the local Prometheus, Grafana and Jae
 ### Residual risks
 
 - ~~**No Alertmanager yet.**~~ On AWS (M7) the critical rules are CloudWatch alarms that notify SNS by email. Locally, alerts are still only visible in Prometheus.
-- **Grafana allows anonymous read-only access locally.** That's fine on loopback; on AWS it goes behind SSO (M7).
+- **Grafana allows anonymous read-only access locally.** That's fine on loopback. The AWS deployment (M7) runs no Grafana: metrics, traces and alarms are in CloudWatch and X-Ray behind IAM.
 - ~~**The trace exporter has no authentication.**~~ On AWS (M7) the collector is a sidecar listening on the task's loopback only, so nothing outside the task can reach it.
 
 ## Keys in KMS and the container image (M7)
@@ -425,3 +425,63 @@ Metrics endpoints, trace export (OTLP) and the local Prometheus, Grafana and Jae
 - **A redeploy stops the services while migrations run.** Fine for a demo; production would run expand-only migrations ahead of a rolling deploy.
 - **Images on GHCR must be public, or the deployer needs pull credentials.** GHCR creates packages as private.
 
+
+## Residual risk register (end of M7)
+
+Every residual risk above, in one place. **Closed**: a later milestone removed it. **Accepted**: deliberate for a portfolio system on testnets, with the reason. **Later**: real work a production deployment would need; most are on the design doc's Evolution list.
+
+### Closed
+
+| Risk | Closed by |
+| --- | --- |
+| `needs_resolution` without a resolver (M2) | M3 resolver |
+| Rail mismatch, DLQ, outbox lag, SLA, reorg, recon breaks not alerted (M2–M6) | M6 alert rules; CloudWatch alarms on AWS (M7) |
+| Dev mode runs the worker in the API process (M3) | M5 standalone worker |
+| Unsigned queue messages: anyone with queue access (M3) | M7 IAM: only the relay sends, only the worker receives; TLS-only queue policy |
+| Solana authority key in a file (M4) | M7 KMS Ed25519 key |
+| Noah signing key and data key as env/file (M5) | M7 KMS: signing inside KMS; data key wrapped |
+| Trace exporter without authentication (M6) | M7 collector sidecar on the task's loopback |
+| Alerts not routed to a person (M6) | M7 SNS email |
+| Grafana anonymous access (M6) | Loopback only; no Grafana on AWS |
+| Unsigned images deployable (M7) | M7 `make aws-up`: cosign verify, deploy by digest |
+| `migrate -app-login` could hand a powerful role to the services | SA-005 (M7) |
+
+### Accepted
+
+| Risk | Why it is acceptable here |
+| --- | --- |
+| Owner and superuser can drop triggers (M1) | They run migrations only; on AWS the owner secret is readable by `migrate` alone and connections are logged |
+| `posted` can drift from postings at the DB level (M1) | Only `PostEntry` writes it; invariants detect drift and page |
+| Double posting under a different key (M1) | Deterministic keys in `ledger/rules.go`; code review |
+| `accounts.owner_id` not a foreign key (M2) | Accounts are created in the customer's transaction |
+| Customer creation not idempotent (M2) | Operator action, rare |
+| Single shared operator key (M2) | Portfolio deployment; generated into Secrets Manager on AWS |
+| Single RPC provider per chain (M4) | Testnets; recon re-reads balances |
+| Dust deposits credited (M4) | Testnets; a minimum comes with the sweep |
+| Squatting with a leaked authority key (M4) | Key is in KMS; provisioning refuses foreign accounts |
+| Local Solana validator without seccomp (M4) | Local and tests only, bound to loopback |
+| Masked bank display shows last four digits (M5) | Standard practice |
+| Bounded ExternalID and return lookups (M5) | Unknown outcomes keep the hold; recon catches what the lookup misses |
+| A large reversal stops for a human (M5) | By design; it pages |
+| Deposits made before the watcher started stay breaks (M6) | By design: Ferry never credits money it did not see arrive |
+| A running task can still sign (M7) | Inherent to KMS; key policies name exact roles; CloudTrail |
+| One NAT gateway, single-AZ RDS, no deletion protection (M7) | Dev cost; variables for production |
+| No webhook IP allowlist (M7) | The signature is the authentication; WAF rate-limits |
+| Redeploy stops services during migrations (M7) | Demo environment |
+| GHCR package visibility (M7) | Operator setting, documented in the deploy guide |
+
+### Later
+
+| Risk | What it needs |
+| --- | --- |
+| No per-key rate limits, scopes or key rotation for customer API keys (M2) | Per-key limits and scopes; a rotation endpoint |
+| No audit log of operator actions (M2) | Append-only admin audit table |
+| Outbox and inbox rows never pruned (M3) | Time partitioning and archiving (Evolution) |
+| Resolver polls every stale payout each round (M3) | Per-payout backoff (`next_sync_at`) |
+| Address-list log filters, per-account Solana RPC calls, per-address recon reads (M4, M6) | Indexer or Multicall at volume |
+| Funds in deposit addresses not swept (M4) | The treasury sweep |
+| One data key, no re-encryption job (M5) | Rotation job using `key_id` |
+| Noah sandbox behaviour assumed, not observed (M5) | A sandbox key: run `sandbox_test.go` and one real payout |
+| What follows a reversal (`AdjustmentFor`) unverified (M5) | Same |
+| Password DB login instead of IAM auth; manual secret rotation (M7) | pgx `BeforeConnect` token hook; rotation Lambdas |
+| AWS stack not applied yet (M7) | A first `make aws-up` |

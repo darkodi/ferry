@@ -64,7 +64,23 @@ func TestEnsureLogin(t *testing.T) {
 		t.Fatal("old password still works")
 	}
 
+	// Roles that look harmless by their attributes but carry power through
+	// membership or ownership (SA-005).
+	for _, s := range []string{
+		"CREATE ROLE writes_all LOGIN",
+		"GRANT pg_write_all_data TO writes_all",
+		"CREATE ROLE owns_table LOGIN",
+		"CREATE TABLE owned_by_login (id int)",
+		"ALTER TABLE owned_by_login OWNER TO owns_table",
+	} {
+		if _, err := owner.ExecContext(t.Context(), s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
 	for name, c := range map[string]struct{ role, pw string }{
+		"member of another role":  {"writes_all", pw1},
+		"owner of a table":        {"owns_table", pw1},
 		"superuser (master user)": {"ferry", pw1},
 		"ferry_app itself":        {"ferry_app", pw1},
 		"quote in name":           {`x"; DROP TABLE postings; --`, pw1},
