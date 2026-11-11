@@ -26,7 +26,7 @@ SQLC_VERSION          := v1.31.1
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
-.PHONY: help up obs-up alerts-check down migrate migrate-status run relay worker recon fake-noah watcher watcher-solana contracts chain-setup evm-setup solana-setup test lint vet vuln gitleaks sqlc tools
+.PHONY: help up image obs-up alerts-check down migrate migrate-status run relay worker recon fake-noah watcher watcher-solana contracts chain-setup evm-setup solana-setup test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -34,6 +34,9 @@ help: ## Show this help
 up: ## Start local infra (Postgres, queue, local chains) and wait until healthy
 	@mkdir -p .dev/solana  # before Docker would create it as root for the bind mount
 	docker compose up -d --wait
+
+image: ## Build the container image (one image, every binary) as ferry:local
+	docker build -t ferry:local .
 
 obs-up: ## Start Prometheus (:9090), Grafana (:3000) and Jaeger (:16686), all on 127.0.0.1
 	docker compose --profile observability up -d

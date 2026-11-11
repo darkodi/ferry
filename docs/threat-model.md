@@ -227,7 +227,7 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 
 ### Residual risks
 
-- **The authority key is a file in dev.** It is read from `FERRY_SOLANA_AUTHORITY_KEYPAIR` (git-ignored `.dev/` locally). On devnet keep it outside the repo with tight permissions, and move it to KMS in M7.
+- ~~**The authority key is a file in dev.**~~ Addressed in M7: on AWS the authority is a KMS Ed25519 key (`FERRY_SOLANA_AUTHORITY_KMS_KEY_ID`) that never leaves KMS; the keypair file remains for local runs only.
 - **Squatting with a leaked authority.** Someone with the authority key could create an account at a future customer's address with themselves as owner. Provisioning would refuse to activate it, but the address would be lost and need an operator to re-derive it. KMS (M7) and keeping the key on the watcher host only limit this.
 - **One RPC call per deposit account per round.** `getSignaturesForAddress` pages back from the newest finalized signature each round. That is fine at portfolio scale; at volume, remember the last signature per account (`until`) or use a webhook or indexer.
 - **The validator container runs without seccomp.** Agave 3 needs `io_uring`, which Docker's default seccomp profile blocks. This applies only to the local and test validator, which binds to loopback; a custom profile that allows just `io_uring_*` would be tighter.
@@ -268,7 +268,7 @@ The Solana watcher shares the engine above (cursor, idempotent credit, leader lo
 
 ### Residual risks
 
-- **Keys are environment variables and files.** `NOAH_API_KEY`, the signing key file and `FERRY_DATA_KEY` sit in the process environment or on disk until KMS (M7). Anyone who can read them can spend the Noah balance or decrypt bank details.
+- **Keys are environment variables and files** (partly addressed in M7). The Noah signing key and the data key now live in KMS on AWS: signing happens inside KMS, and the data key is stored wrapped and unwrapped only in memory. `NOAH_API_KEY` is still a bearer secret (Secrets Manager on AWS), and on its own it cannot sign a request in production. Locally the env and file forms remain.
 - **One data key, no rotation yet.** `key_id` records which key encrypted each row, so rotation is possible, but there is no re-encryption job.
 - **Sandbox behaviour is assumed, not observed.** Until a sandbox key exists, these come from the docs, encoded in the fake: what a resent Nonce returns, the authorized-amount format, `queryParams` typing in the signature, and Breakdown on settlement. `sandbox_test.go` checks them.
 - **The lookup by `ExternalID` is bounded** to the last 7 days and 10 pages of 100 transactions. If the page limit is reached first, the outcome is reported as unknown and the hold is kept. A sale older than 7 days would not be found. That is unrealistic, because the resolver resends within minutes of an unclear answer.
@@ -363,4 +363,24 @@ Metrics endpoints, trace export (OTLP) and the local Prometheus, Grafana and Jae
 - **No Alertmanager yet.** Alerts are visible in Prometheus; routing them to a person (SNS, pager) is M7.
 - **Grafana allows anonymous read-only access locally.** That's fine on loopback; on AWS it goes behind SSO (M7).
 - **The trace exporter has no authentication.** OTLP goes to a local collector; on AWS the collector runs in the private subnet (M7).
+
+## Keys in KMS and the container image (M7)
+
+**Assets:** the Noah signing key, the Solana authority key and the data key (all three can move money or reveal bank details); the image that runs everywhere.
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **I**nformation disclosure: key theft | A compromised task or a leaked env file exposes a private key | On AWS the keys never leave KMS. A stolen task role can sign only while it is running and while CloudTrail logs every `Sign` call; it cannot copy the key | design; `TestRealKMS` against AWS when keys are provided |
+| **T**ampering: wrong or swapped key | A config points at another key, or a key of the wrong spec | Each signer checks key spec and usage at startup, and verifies every signature against the public key it read before using it | `TestKeySpecChecked`, `TestForgedSignaturesRefused` |
+| **T**ampering: malformed KMS answer | A malformed or non-canonical DER signature | Strict DER parsing (positive r and s, no trailing bytes), and a range check before the JWS encoding | `TestParseDER`, `FuzzParseDER` |
+| **T**ampering: double hashing | A digest signed as `RAW` gets hashed twice, so signatures never verify | P-384 signs with `MessageType=DIGEST`; Ed25519 with `RAW` (pure EdDSA). The fake KMS refuses any other combination | `TestNoahSignsThroughKMS`, `TestEd25519SignsThroughKMS` |
+| **T**ampering: image supply chain | A moved base-image tag or a compromised action changes what ships | Base images and actions are pinned by digest or SHA. The image is signed keylessly (cosign, GitHub OIDC) with an SBOM and provenance, and scanned with Trivy | CI `image` job |
+| **E**levation of privilege: container breakout | A bug gives a shell in the container | Distroless (no shell, no package manager), non-root, read-only root filesystem | CI smoke test (`--read-only`, user check) |
+
+### Residual risks
+
+- **A running task can still sign.** KMS limits key *theft*, not *use*. A compromised API or worker task can ask KMS to sign Noah requests while it runs. IAM scopes each key to the services that need it (M7 PR 2), and CloudTrail records every call.
+- **Unsigned images can still be pulled locally.** Verifying the cosign signature at deploy time (`cosign verify` before the copy to ECR) is part of `make aws-up` (M7 PR 2).
 

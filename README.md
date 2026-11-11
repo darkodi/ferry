@@ -26,6 +26,16 @@ Payouts go to saved bank accounts (`POST /v1/destinations`), which Ferry stores 
 
 There's no Noah sandbox key yet, so this runs against a fake Noah server built from the documented API (`make fake-noah`). `internal/rail/noah/sandbox_test.go` is ready for the real sandbox. The default rail is still the in-memory mock that settles at once.
 
+## Container image
+
+`make image` builds one distroless, non-root image with every binary (`/ferry/api`, `relay`, `worker`, `watcher`, `recon`, `migrate`); choose one with `--entrypoint`. CI publishes it to `ghcr.io/darkodi/ferry` on every merge to main, signed with cosign and with an SBOM:
+
+```bash
+cosign verify ghcr.io/darkodi/ferry:main \
+  --certificate-identity-regexp 'https://github.com/darkodi/ferry/.github/workflows/ci.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 ## Run locally
 
 Requires Go (version in `go.mod`), Docker and make.

@@ -95,7 +95,7 @@ func run(log *slog.Logger) error {
 		checkers = append(checkers, recon.NewChain(pool, solana.NewBalances(envOr("FERRY_SOLANA_CHAIN", "solana-local"), rpc.New(rpcURL))))
 	}
 	if os.Getenv("FERRY_RAIL") == "noah" {
-		nr, err := noah.FromEnv(os.Getenv, time.Now)
+		nr, err := noah.FromEnv(ctx, os.Getenv, time.Now)
 		if err != nil {
 			return err
 		}

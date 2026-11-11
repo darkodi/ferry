@@ -406,7 +406,7 @@ Design notes:
 
 Solana keys and provisioning:
 
-- **Three keys, one secret.** The *authority* is the seed base of every deposit address and pays account rent. Its keypair file is read only by the Solana watcher (dev key in `.dev/`, KMS in M7). The *deposit owner* is the token owner of every deposit account, and only its key can move deposited USDC. Ferry holds just its public key; the private key belongs to the future sweep. The API needs only the authority's public key. The watcher refuses to start if the owner and the authority are the same key.
+- **Three keys, one secret.** The *authority* is the seed base of every deposit address and pays account rent. Only the Solana watcher signs with it: as an AWS KMS Ed25519 key on AWS (`FERRY_SOLANA_AUTHORITY_KMS_KEY_ID`), or as a keypair file locally (dev key in `.dev/`). The *deposit owner* is the token owner of every deposit account, and only its key can move deposited USDC. Ferry holds just its public key; the private key belongs to the future sweep. The API needs only the authority's public key. The watcher refuses to start if the owner and the authority are the same key.
 - **Provisioning.** The address must hold an initialised token account before USDC can land there. Each round the watcher creates up to 20 missing accounts with `createAccountWithSeed` + `InitializeAccount3` (mint = USDC, owner = deposit owner), waits for confirmation, checks the account, and marks it `active`. It is idempotent: an existing account is only checked (owner program, size, mint, owner, state, no delegate or close authority) and never re-created. A failing address is logged and retried the next round, without stopping the scan.
 - **Pre-funded addresses.** Anyone can send SOL to a deposit address before its account exists, and the system program then refuses `createAccountWithSeed`. A bare system account is therefore topped up to rent exemption and turned into the token account with `allocateWithSeed` instead, so a stranger's dust cannot block a customer's address.
 - **Provisioning addresses are watched too.** If the watcher stops after creating an account but before marking it `active`, a deposit that lands in between is still found. The status shown by the API tells customers when to send.
@@ -631,6 +631,18 @@ Keep a teardown script; run the AWS stack only when demoing, to stay inside free
 - **Money controls:** per-customer limits and velocity checks, an allowlist of sweep destinations, two-person approval for manual ledger adjustments, and an append-only audit log of every admin action.
 - **Ledger integrity:** append-only journal and a least-privilege app role (see Ledger); the invariant job checks every balance against the postings.
 - **Keys and infrastructure:** least-privilege IAM per ECS service; signing keys never leave KMS; secrets in Secrets Manager.
+
+**Keys as built (M7, `internal/platform/awskms`).** Every private key Ferry uses can live in AWS KMS. Ferry asks KMS to sign or decrypt and never holds the key; the env and file forms remain for local runs. A binary refuses to start if both forms of one key are set.
+
+| Key | KMS key spec and call | Used by | Local fallback |
+| --- | --- | --- | --- |
+| Noah request signing | `ECC_NIST_P384`; `Sign` with `ECDSA_SHA_384` on the SHA-384 digest (`MessageType=DIGEST`). KMS returns ASN.1 DER, and Ferry converts it to the JWS `r‖s` form | api, worker, recon (`NOAH_SIGNING_KMS_KEY_ID`) | `NOAH_SIGNING_KEY_PATH` |
+| Solana authority | `ECC_NIST_EDWARDS25519`; `Sign` with `ED25519_SHA_512` on the serialized transaction message (`MessageType=RAW`, pure EdDSA); the signature goes into the transaction | watcher-solana (`FERRY_SOLANA_AUTHORITY_KMS_KEY_ID`) | `FERRY_SOLANA_AUTHORITY_KEYPAIR` |
+| Bank-details data key | symmetric; the 32-byte key is stored wrapped (`FERRY_DATA_KEY_ENCRYPTED`, the `CiphertextBlob`) and unwrapped once at startup with `Decrypt` | api | `FERRY_DATA_KEY` |
+
+Each signer reads its key's public key when it starts (wrong key id, spec or usage fails then, not at the first payout) and verifies every signature KMS returns before using it.
+
+**Container image.** One distroless, non-root image holds every binary (`/ferry/api`, `relay`, `worker`, `watcher`, `recon`, `migrate`). Base images are pinned by digest, and the image runs with a read-only root filesystem. CI builds it on every pull request, smoke-tests each binary and scans it with Trivy (failing on fixable HIGH or CRITICAL findings). On `main` CI pushes it to `ghcr.io/darkodi/ferry` with an SBOM and build provenance, and signs it keylessly with cosign. `cmd/migrate` applies the embedded migrations as a one-off task.
 - **Code hygiene:** Go fuzz tests on amount parsing and webhook decoding; `gosec`, `govulncheck`, `gitleaks` in CI.
 - **Documents:** `docs/threat-model.md` (STRIDE per component and trust boundary) and `docs/self-audit.md` (findings, severity, fix PRs) — the auditor's view of your own system.
 

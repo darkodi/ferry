@@ -34,7 +34,7 @@ func sandbox(t *testing.T) *noah.Rail {
 	if b := os.Getenv("NOAH_BASE_URL"); b != "" && b != "https://api.sandbox.noah.com/v1" {
 		t.Skipf("NOAH_BASE_URL is %s; the contract test runs only against the sandbox", b)
 	}
-	r, err := noah.FromEnv(os.Getenv, time.Now)
+	r, err := noah.FromEnv(t.Context(), os.Getenv, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}

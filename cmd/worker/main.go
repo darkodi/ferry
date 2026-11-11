@@ -118,7 +118,7 @@ func run(log *slog.Logger) error {
 func railFromEnv(name string) (rail.Rail, error) {
 	switch name {
 	case "noah":
-		return noah.FromEnv(os.Getenv, time.Now)
+		return noah.FromEnv(context.Background(), os.Getenv, time.Now)
 	case "", "mock":
 		return nil, errors.New("the mock rail lives in one process's memory and cannot serve a separate worker; " +
 			"set FERRY_RAIL=noah, or run cmd/api with FERRY_ENV=dev, which runs the worker in-process")

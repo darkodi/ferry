@@ -1,21 +1,27 @@
 package noah
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/darkodi/ferry/internal/platform/awskms"
 )
 
 // FromEnv builds the adapter from the environment (see .env.example):
 //
 //	NOAH_BASE_URL          API base (default https://api.sandbox.noah.com/v1)
 //	NOAH_API_KEY           API key (required)
-//	NOAH_SIGNING_KEY_PATH  PEM P-384 private key for Api-Signature; optional
-//	                       in sandbox, required in production
+//	NOAH_SIGNING_KEY_PATH  PEM P-384 private key for Api-Signature (local);
+//	NOAH_SIGNING_KMS_KEY_ID  or an AWS KMS ECC_NIST_P384 key that signs instead
+//	                       (the private key never leaves KMS); one of the two
+//	                       is optional in sandbox, required in production
+//	FERRY_KMS_ENDPOINT     KMS endpoint override (e.g. LocalStack); empty for AWS
 //	NOAH_CRYPTO_CURRENCY   what Ferry sells (default USDC_TEST)
 //	NOAH_QUOTE_TTL         how long a prepared price is honoured (default 2m)
-func FromEnv(getenv func(string) string, now func() time.Time) (*Rail, error) {
+func FromEnv(ctx context.Context, getenv func(string) string, now func() time.Time) (*Rail, error) {
 	base := getenv("NOAH_BASE_URL")
 	if base == "" {
 		base = "https://api.sandbox.noah.com/v1"
@@ -25,7 +31,23 @@ func FromEnv(getenv func(string) string, now func() time.Time) (*Rail, error) {
 		return nil, errors.New("NOAH_API_KEY is required for the noah rail")
 	}
 	var signer *Signer
-	if path := getenv("NOAH_SIGNING_KEY_PATH"); path != "" {
+	path, kmsKey := getenv("NOAH_SIGNING_KEY_PATH"), getenv("NOAH_SIGNING_KMS_KEY_ID")
+	switch {
+	case path != "" && kmsKey != "":
+		return nil, errors.New("set NOAH_SIGNING_KEY_PATH or NOAH_SIGNING_KMS_KEY_ID, not both")
+	case kmsKey != "":
+		api, err := awskms.New(ctx, getenv("FERRY_KMS_ENDPOINT"))
+		if err != nil {
+			return nil, err
+		}
+		ks, err := awskms.NewECDSASigner(ctx, api, kmsKey)
+		if err != nil {
+			return nil, err
+		}
+		if signer, err = NewDigestSigner(ks, ks.Public(), now); err != nil {
+			return nil, err
+		}
+	case path != "":
 		b, err := os.ReadFile(path) //nolint:gosec // the operator names the key file
 		if err != nil {
 			// Name the file, never its contents.

@@ -37,7 +37,7 @@ func TestSignClaims(t *testing.T) {
 	}
 	body := []byte(`{"Nonce":"n-1","FiatAmount":"100.00"}`)
 	q := url.Values{"Country": {"US"}, "FiatCurrency": {"USD"}}
-	tok, err := s.Sign("POST", "/v1/transactions/sell", q, body)
+	tok, err := s.Sign(t.Context(), "POST", "/v1/transactions/sell", q, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestSignClaims(t *testing.T) {
 func TestSignOmitsEmptyClaims(t *testing.T) {
 	key := p384(t)
 	s, _ := noah.NewSigner(key, func() time.Time { return signTime })
-	tok, err := s.Sign("GET", "/v1/transactions/abc", nil, nil)
+	tok, err := s.Sign(t.Context(), "GET", "/v1/transactions/abc", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestSignOmitsEmptyClaims(t *testing.T) {
 	if c.BodyHash != "" || c.QueryParams != nil {
 		t.Fatalf("claims %+v, want no bodyHash or queryParams", c)
 	}
-	if _, err := s.Sign("GET", "/v1/x", url.Values{"a": {"1", "2"}}, nil); err == nil {
+	if _, err := s.Sign(t.Context(), "GET", "/v1/x", url.Values{"a": {"1", "2"}}, nil); err == nil {
 		t.Fatal("signed a repeated query parameter the claim cannot express")
 	}
 }
