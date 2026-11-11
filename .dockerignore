@@ -9,5 +9,7 @@ coverage.*
 *.test
 docs
 deploy
+# ...except the public AWS RDS CA bundle the image ships (sslmode=verify-full).
+!deploy/rds/global-bundle.pem
 contracts/build/*.bin.*
 **/testdata/fuzz

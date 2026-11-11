@@ -429,3 +429,11 @@ func TestDepositAddresses(t *testing.T) {
 		wantStatus(t, call(t, "GET", "/v1/customers/"+id+path, other, "", nil), http.StatusNotFound)
 	}
 }
+
+// The load balancer's health check: 200 while the database answers,
+// without authentication, and only for GET or HEAD.
+func TestHealthz(t *testing.T) {
+	wantStatus(t, call(t, "GET", "/healthz", "", "", nil), http.StatusOK)
+	wantStatus(t, call(t, "HEAD", "/healthz", "", "", nil), http.StatusOK)
+	wantStatus(t, call(t, "POST", "/healthz", "", "", nil), http.StatusMethodNotAllowed)
+}

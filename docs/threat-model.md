@@ -360,9 +360,9 @@ Metrics endpoints, trace export (OTLP) and the local Prometheus, Grafana and Jae
 
 ### Residual risks
 
-- **No Alertmanager yet.** Alerts are visible in Prometheus; routing them to a person (SNS, pager) is M7.
+- ~~**No Alertmanager yet.**~~ On AWS (M7) the critical rules are CloudWatch alarms that notify SNS by email. Locally, alerts are still only visible in Prometheus.
 - **Grafana allows anonymous read-only access locally.** That's fine on loopback; on AWS it goes behind SSO (M7).
-- **The trace exporter has no authentication.** OTLP goes to a local collector; on AWS the collector runs in the private subnet (M7).
+- ~~**The trace exporter has no authentication.**~~ On AWS (M7) the collector is a sidecar listening on the task's loopback only, so nothing outside the task can reach it.
 
 ## Keys in KMS and the container image (M7)
 
@@ -381,6 +381,47 @@ Metrics endpoints, trace export (OTLP) and the local Prometheus, Grafana and Jae
 
 ### Residual risks
 
-- **A running task can still sign.** KMS limits key *theft*, not *use*. A compromised API or worker task can ask KMS to sign Noah requests while it runs. IAM scopes each key to the services that need it (M7 PR 2), and CloudTrail records every call.
-- **Unsigned images can still be pulled locally.** Verifying the cosign signature at deploy time (`cosign verify` before the copy to ECR) is part of `make aws-up` (M7 PR 2).
+- **A running task can still sign.** KMS limits key *theft*, not *use*. A compromised API or worker task can ask KMS to sign Noah requests while it runs. Key policies name the exact task roles that may use each key (see "AWS deployment"), and CloudTrail records every call.
+- ~~**Unsigned images can still be pulled locally.**~~ `make aws-up` deploys only a digest whose cosign signature came from this repository's CI on `main`, and checks that ECR holds exactly that digest. ECS runs it by digest.
+
+## AWS deployment (M7)
+
+**Assets:** the database (ledger, encrypted bank details), the three application keys, the secrets (Noah API key, admin key, database password, wrapped data key, RPC URLs), the image, and the AWS account itself.
+
+**Trust boundaries:**
+
+| Boundary | Crossing | Control |
+| --- | --- | --- |
+| TB9 Internet → ALB | Customer, operator and Noah webhook HTTPS | WAF (managed rules, per-IP rate limit), TLS 1.2+, invalid headers dropped, HTTP only redirects |
+| TB10 ALB → API task | HTTP on 8080 inside the VPC | `api` security group accepts only the ALB's group |
+| TB11 Tasks → AWS APIs | KMS, Secrets Manager, SQS, Logs, X-Ray, ECR | VPC endpoints; a task role and an execution role per task; key policies name exact roles |
+| TB12 Tasks → internet | Noah API, chain RPCs | Through the NAT, port 443 only |
+| TB13 Tasks → RDS | Postgres | Only the `api` and `tasks` groups reach 5432; TLS required by the server and verified by clients (`verify-full` against the RDS CA) |
+| TB14 Operator → AWS | Terraform and `make aws-up` | The operator's IAM credentials; CloudTrail |
+
+### STRIDE
+
+| Threat | Example | Mitigation | Verified by |
+| --- | --- | --- | --- |
+| **S**poofing: forged image | A registry or tag is changed to ship other code | Deploys take only a digest whose keyless cosign signature came from this repository's CI on `main`. ECR tags are immutable and tasks run by digest | `aws.sh` (`cosign verify`, ECR digest check); `ecs` test `tag_refused` |
+| **S**poofing: a database impostor | Something answers on the database host name inside the VPC | Clients use `sslmode=verify-full` against the AWS RDS CA bundle in the image | `dev` test (`verify-full` on every task) |
+| **T**ampering: one task uses another's power | A compromised watcher signs Noah requests or reads bank details | One task role per task. Key policies name only: api, worker and recon for Noah; watcher-solana for the authority; api for the data key. Execution roles read only their own task's secrets | `dev` test `least_privilege`; `keys` test `policies` |
+| **T**ampering: an administrator grants themselves the keys | IAM `kms:*` or a grant used to sign or decrypt | The account may administer the application keys but not use them, and has no `CreateGrant`. Using a key requires changing its policy, which CloudTrail records | `keys` test `policies` |
+| **R**epudiation | Who signed, who read a secret | CloudTrail records KMS `Sign`/`Decrypt` and `GetSecretValue`; VPC flow logs; ALB access logs; WAF logs (with `Authorization` redacted) | design |
+| **I**nformation disclosure: secrets in state or config | Terraform state or a task definition holds a password | Terraform creates the secrets but not their values; RDS manages the master password; task definitions name secrets by ARN only | `dev` test (no secret as a plain env var) |
+| **I**nformation disclosure: data at rest | Snapshot, log or queue read by someone with storage access | RDS, logs, secrets, SNS and ECR are encrypted with the `infra` KMS key; SQS uses SSE; the ALB log bucket uses SSE-S3 (the only kind ALB supports) and blocks public access | checkov |
+| **D**enial of service | A flood of requests | WAF per-IP rate limit (1000 per 5 minutes by default) and AWS managed rules; ECS services restart failed tasks; the deployment circuit breaker rolls back a bad release | design |
+| **E**levation of privilege: container to host | A bug gives code execution in a task | Distroless, non-root (65532), read-only root filesystem, all Linux capabilities dropped, no ECS Exec, no public IP | `ecs` test `hardening` |
+| **E**levation of privilege: app to schema | The app's database login alters or deletes the ledger | Services log in as `ferry_svc`, a member of `ferry_app` only (append-only grants). `migrate -app-login` refuses to touch a role with any administrative attribute | `TestEnsureLogin` |
+
+### Residual risks
+
+- **Not applied yet.** The stack is checked offline (validate, `terraform test` with a mocked provider, tflint, checkov) but has not run against AWS. Expect small fixes on the first `make aws-up`.
+- **One NAT gateway.** If its AZ fails, tasks lose outbound access (Noah, RPCs) until it is back. Accepted in dev for cost.
+- **Single-AZ database, no deletion protection in dev.** Both are variables (`multi_az`, `deletion_protection`) to turn on for production.
+- **Password login, not IAM database authentication.** The app login's password sits in Secrets Manager. IAM auth would need a pgx `BeforeConnect` hook to refresh 15-minute tokens. Later work.
+- **No automatic secret rotation.** To rotate, put a new value (`aws secretsmanager get-random-password` piped into `put-secret-value`) and re-run `make aws-up`: it keeps the new value, `migrate` sets the database password to it, and the services restart with it. The Noah key and RPC URLs rotate the same way with values from their issuers.
+- **The webhook path has no IP allowlist.** Noah's signature is the authentication; WAF rate-limits the path like any other.
+- **A redeploy stops the services while migrations run.** Fine for a demo; production would run expand-only migrations ahead of a rolling deploy.
+- **Images on GHCR must be public, or the deployer needs pull credentials.** GHCR creates packages as private.
 

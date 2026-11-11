@@ -20,6 +20,10 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 # Runtime stage.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /out/ /ferry/
+# Public AWS RDS root CAs, so services verify the database's certificate
+# (PGSSLMODE=verify-full, PGSSLROOTCERT=/ferry/rds-ca.pem). Source:
+# https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+COPY deploy/rds/global-bundle.pem /ferry/rds-ca.pem
 USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/ferry/api"]

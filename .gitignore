@@ -12,11 +12,14 @@ vendor/
 !.env.example
 *.pem
 *.key
+# Public AWS RDS root CAs, shipped in the image (not a secret).
+!deploy/rds/global-bundle.pem
 # Dev keypairs created by `make chain-setup` (Solana authority, wallet, mint)
 .dev/
 
 # Terraform
 .terraform/
+.tflint.d/
 *.tfstate
 *.tfstate.*
 *.tfvars

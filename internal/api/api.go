@@ -113,7 +113,33 @@ func New(cfg Config) http.Handler {
 			})
 		})
 	})
-	return r
+	return withHealth(r, cfg.Pool)
+}
+
+// withHealth answers GET /healthz for the load balancer ahead of the
+// router, so health checks are not logged as requests: 200 when the
+// database answers within two seconds, 503 otherwise. It reveals nothing
+// else.
+func withHealth(next http.Handler, pool *pgxpool.Pool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if pool != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := pool.Ping(ctx); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 }
 
 // ---- auth ----

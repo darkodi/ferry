@@ -596,6 +596,49 @@ This table is the section an interviewer will probe; each row should have a test
 
 Keep a teardown script; run the AWS stack only when demoing, to stay inside free-tier and a few dollars.
 
+**As built (M7, `deploy/terraform`).** One `dev` environment (`envs/dev`) composed of modules. The code is checked offline in CI and has not been applied yet.
+
+| Module | What it creates |
+| --- | --- |
+| `iam` | A task role and an execution role per task, trust policy only. They exist first so the KMS key policies can name them |
+| `keys` | The three application keys (Noah P-384, Solana Ed25519, data key) and an `infra` key for logs, RDS, secrets, SNS and ECR. The account may administer an application key but not use it: no Sign, Decrypt or CreateGrant through IAM. Only the roles in the key policy can use it |
+| `network` | VPC over two pinned AZs. Public subnets hold only the ALB and one NAT gateway; tasks and RDS run in private subnets. VPC flow logs; a default security group with no rules; interface endpoints for ECR, Logs, KMS, Secrets Manager, SQS and X-Ray, plus an S3 gateway. Security groups: `alb` (443, and 80 for the redirect) → `api` (8080) → `db` (5432); `tasks` has no inbound rules; api and tasks may only reach 443 and the database |
+| `data` | RDS Postgres 16, encrypted. `rds.force_ssl` is on and the master password is managed by RDS in Secrets Manager. Enhanced monitoring, Performance Insights and exported logs are on |
+| `queue` | `payouts` and its DLQ (`maxReceiveCount` 5, as in ElasticMQ). SSE, and a policy that denies non-TLS requests |
+| `secrets` | Six Secrets Manager entries. Terraform never writes their values (see below) |
+| `ecs` | ECR (immutable tags, scan on push, KMS). A Fargate cluster with one task definition per binary, each with an ADOT sidecar. Services: `api` (behind the ALB), `relay`, `worker`, `watcher-evm` and `watcher-solana` (singletons: stopped before their replacement starts). `recon` runs daily from EventBridge Scheduler; `migrate` is a one-off task |
+| `edge` | ALB (TLS 1.2+ with an ACM certificate, HTTP redirected, invalid headers dropped, access logs) and AWS WAF: AWS managed rules (common, known bad inputs including Log4j, IP reputation), a per-IP rate limit, and logs with the `Authorization` header redacted |
+| `alarms` | SNS (KMS) with email; CloudWatch alarms mirroring the critical Prometheus rules (invariant violation, rail mismatch, credited deposit reorged, deep reorg, outbox lag, recon not running, unknown submit outcomes) plus DLQ not empty, API 5xx and no healthy API task; an AWS Budgets alert |
+
+- **Containers.** Every container runs the one image, pinned by digest (Terraform refuses a tag). Each is non-root (65532), has a read-only root filesystem and drops all Linux capabilities. The task picks its binary with `entryPoint`.
+- **Database login.** Services connect as `ferry_svc`, a login role whose only power is membership of the NOLOGIN `ferry_app` (00002). `migrate -app-login ferry_svc` creates it, or resets its password, as the database owner. It refuses any role with administrative attributes, and any password that is not plain letters and digits, because the password is written into SQL. Services pass `DATABASE_URL=postgres:///ferry?sslmode=verify-full&sslrootcert=/ferry/rds-ca.pem` and get host, user and password from `PGHOST`, `PGUSER` and `PGPASSWORD` (pgx reads them as libpq does). They verify the server against the AWS RDS CA bundle shipped in the image (`deploy/rds/global-bundle.pem`).
+- **Secrets without state.** Terraform creates each secret but never its value, so Terraform state holds none. `make aws-up` fills a secret only if it is empty:
+  - admin key and DB password: from Secrets Manager's random generator;
+  - data key: `GenerateDataKeyWithoutPlaintext`, so nobody ever sees the plaintext;
+  - Noah key and RPC URLs: from the operator's `.env`.
+
+  ECS injects each task's secrets as environment variables. Its execution role can read only that task's secrets.
+- **Who may do what.** `envs/dev/main.tf` lists each task's environment, secrets and permissions in one map:
+  - Noah key (sign): api, worker, recon;
+  - Solana authority (sign): watcher-solana; the API reads only its public key to derive deposit addresses (`FERRY_SOLANA_AUTHORITY_KMS_KEY_ID`);
+  - data key (unwrap): api;
+  - queue: relay sends; worker receives and deletes;
+  - database owner credentials: migrate only.
+
+  `terraform test` checks this map against a mocked provider, along with the key policies and the container hardening.
+- **Metrics and traces on AWS.** The ADOT sidecar scrapes the task's `/metrics` on loopback (`FERRY_METRICS_ADDR=127.0.0.1:9100`). It sends the alarmed series to CloudWatch (namespace `Ferry`, dimension `service`, plus `check` or `status`/`review` where the alarm needs them) and the traces from `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` to X-Ray. The ALB checks `GET /healthz`, which answers 200 only while the database responds; health checks are not logged.
+- **Deploying** (`deploy/terraform/scripts/aws.sh`):
+  1. `cosign verify` the `main` image, signed by this repository's CI workflow, and take its digest.
+  2. Apply with the services stopped.
+  3. Copy the image to ECR by digest (`docker buildx imagetools create` keeps the index as is) and check that ECR holds exactly that digest.
+  4. Fill the empty secrets.
+  5. Run `migrate` and require exit code 0.
+  6. Apply again with the services running.
+
+  A redeploy therefore has a short outage, which is fine for a demo environment. Production would run expand-only migrations ahead of a rolling deploy. `make aws-plan` and `make aws-down` complete the set.
+- **Checks** (`make tf-check`, CI job `terraform`, no credentials): `terraform fmt`, `validate`, `terraform test` (6 runs), `tflint` with the AWS ruleset, and checkov. checkov passes 240 checks; 20 are skipped, each with its reason written next to the resource (dev-only choices such as Multi-AZ and deletion protection, and limits such as ALB logs supporting only SSE-S3).
+- **Cost.** The NAT gateway, interface endpoints (each billed per AZ), RDS and the ALB come to roughly 100 to 150 USD a month while running, and the budget alert defaults to 150 USD. `interface_endpoints = false` lowers that by sending AWS traffic through the NAT. Run the stack only for demos and tear it down with `make aws-down`.
+
 ### Observability
 
 - Structured logs with `slog`, every line carrying `payout_id`, `trace_id`, `idempotency_key`.

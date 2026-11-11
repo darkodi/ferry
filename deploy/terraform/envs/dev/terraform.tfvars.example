@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars (git-ignored) and fill in. No secrets go here:
+# make aws-up reads NOAH_API_KEY and the RPC URLs from .env into Secrets
+# Manager, and generates the rest.
+
+region          = "eu-west-1"
+certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+alarm_email     = "alerts@example.com"
+budget_usd      = 150
+
+# Set by make aws-up from the verified image; shown for a manual plan.
+image_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# Base Sepolia, for example. Omit a chain to run without it.
+# evm = {
+#   chain        = "base-sepolia"
+#   usdc_address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+#   xpub         = "xpub..."
+# }
+
+# solana = {
+#   chain         = "solana-devnet"
+#   usdc_mint     = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+#   deposit_owner = "<deposit owner public key>"
+# }

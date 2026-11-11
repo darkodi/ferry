@@ -1,0 +1,64 @@
+# ADOT collector config for one Ferry task (rendered by Terraform, passed
+# in AOT_CONFIG_CONTENT). Traces: OTLP/HTTP on loopback to X-Ray.
+# Metrics: scrape the task's Prometheus endpoint on loopback and send the
+# alarmed series to CloudWatch as embedded metric format, with the labels
+# listed as dimensions. "$$" is a literal "$" for the collector.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+%{ if metrics_port != null ~}
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: ferry
+          scrape_interval: 60s
+          static_configs:
+            - targets: ["127.0.0.1:${metrics_port}"]
+              labels:
+                service: ${service}
+%{ endif ~}
+processors:
+  batch: {}
+exporters:
+  awsxray:
+    region: ${region}
+%{ if metrics_port != null ~}
+  awsemf:
+    region: ${region}
+    namespace: ${namespace}
+    log_group_name: ${log_group}
+    log_stream_name: ${service}
+    dimension_rollup_option: NoDimensionRollup
+    metric_declarations:
+      - dimensions: [[service]]
+        metric_name_selectors:
+          - "^ferry_outbox_lag_seconds$$"
+          - "^ferry_outbox_unpublished$$"
+          - "^ferry_recon_last_run_age_seconds$$"
+          - "^ferry_payouts_needs_resolution$$"
+          - "^ferry_rail_mismatch_total$$"
+          - "^ferry_watcher_lag_blocks$$"
+          - "^ferry_watcher_credited_reorged_total$$"
+          - "^ferry_watcher_deep_reorg_total$$"
+      - dimensions: [[service, check]]
+        metric_name_selectors:
+          - "^ferry_recon_breaks_open$$"
+          - "^ferry_recon_oldest_open_break_seconds$$"
+      - dimensions: [[service, status, review]]
+        metric_name_selectors:
+          - "^ferry_payout_oldest_in_state_seconds$$"
+%{ endif ~}
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awsxray]
+%{ if metrics_port != null ~}
+    metrics:
+      receivers: [prometheus]
+      processors: [batch]
+      exporters: [awsemf]
+%{ endif ~}
