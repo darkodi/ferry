@@ -15,7 +15,7 @@ The design, its invariants and its failure modes are in [`docs/design.md`](docs/
 | M4 — Chains (EVM and Solana deposits) | done |
 | M5 — Noah rail (destinations, signed adapter, webhooks, returns; sandbox run pending a key) | done |
 | M6 — Recon + ops (reconciliation, top-ups, metrics, traces, alerts, dashboard) | done |
-| M7 | planned |
+| M7 — AWS (keys in KMS, signed image, Terraform checked in CI; not applied yet) | in progress |
 
 What works today: the ledger core. `internal/ledger` posts balanced entries for every event in the design (deposit, top-up, hold, settle, release, bank return, correction), refuses overdrafts even under 100 concurrent requests, deduplicates replayed events, and checks its own invariants. The database rejects unbalanced entries, negative customer balances and any edit of posted history even if the Go code has a bug. On top of it, `internal/payout` runs a payout through quote, hold, submit, settle, release, expiry and bank return against a mock rail, with idempotent creates and safe retries after a rail timeout. `cmd/api` serves it over HTTP with per-customer API keys and `Idempotency-Key` handling. Confirming a payout returns at once with the money held; in the background the outbox relay publishes the event to an SQS queue (ElasticMQ locally), a worker submits the payout to the rail, and a resolver re-drives payouts whose submit timed out or whose rail update never arrived. Customers get their own EVM deposit address, derived from an xpub so Ferry never holds the key. `cmd/watcher` reads USDC transfers to those addresses, shows them as pending, and credits them after N confirmations. It handles reorgs by rewinding and orphaning, and re-checks every block hash before crediting. On Solana, each customer gets a token account at a seed-derived address. The watcher creates it on-chain (signing with a key that can create accounts but cannot move funds), reads only finalized slots, and credits a deposit as soon as it sees it. The treasury sweep out of deposit addresses comes later.
 
@@ -35,6 +35,10 @@ cosign verify ghcr.io/darkodi/ferry:main \
   --certificate-identity-regexp 'https://github.com/darkodi/ferry/.github/workflows/ci.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+## AWS
+
+`deploy/terraform` describes the AWS environment: ECS Fargate services behind an ALB with WAF, RDS Postgres, SQS with a DLQ, KMS keys, Secrets Manager, CloudWatch alarms and X-Ray traces through ADOT sidecars. Every task gets its own IAM role, and only the roles named in each KMS key's policy can use that key. `make tf-check` validates, tests (against a mocked provider), lints and policy-scans it without AWS credentials; CI runs the same. To deploy, see [`deploy/terraform/README.md`](deploy/terraform/README.md) (`make aws-up` / `make aws-down`). The stack has not been applied yet.
 
 ## Run locally
 

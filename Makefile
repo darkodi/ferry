@@ -23,9 +23,19 @@ GITLEAKS_VERSION      := v8.30.1
 GOOSE_VERSION         := v3.29.0
 SQLC_VERSION          := v1.31.1
 
+# Terraform tooling runs in containers pinned by digest; nothing to install.
+TF_IMAGE      := hashicorp/terraform:1.16.7@sha256:c9c77f5b9820832cbc7b88d16df406ac6e75fee5a9077e5437db0c54e5ff33e3
+TFLINT_IMAGE  := ghcr.io/terraform-linters/tflint:v0.65.0@sha256:2788f4d4fc663c0e953b011b01bf443fe5bfce7587ee916e588e6057b85d6359
+CHECKOV_IMAGE := bridgecrew/checkov:3.3.30@sha256:4b65e89f1fde292249fc0aa0d0db43302c036dfe39f7370b2d3517571082b894
+TF_DIR        := $(CURDIR)/deploy/terraform
+TF_RUN         = docker run --rm -u "$$(id -u):$$(id -g)" -e HOME=/tmp -v "$(TF_DIR):/w"
+# Directories with their own tests (and provider lock files).
+TF_TESTED     := envs/dev modules/keys modules/ecs
+
 BIN := $(CURDIR)/bin
 export PATH := $(BIN):$(PATH)
 
+.PHONY: tf-check tf-fmt tf-validate tf-test tf-lint tf-checkov aws-plan aws-up aws-down
 .PHONY: help up image obs-up alerts-check down migrate migrate-status run relay worker recon fake-noah watcher watcher-solana contracts chain-setup evm-setup solana-setup test lint vet vuln gitleaks sqlc tools
 
 help: ## Show this help
@@ -118,6 +128,38 @@ solana-setup: ## Create the test USDC mint on the local Solana validator and fun
 		echo "Solana test USDC mint $$mint (FERRY_SOLANA_USDC_MINT)"; \
 		echo "Solana authority $$(solana-keygen pubkey authority.json) (FERRY_SOLANA_AUTHORITY)"; \
 		echo "Solana deposit owner $$(solana-keygen pubkey owner.json) (FERRY_SOLANA_DEPOSIT_OWNER)"'
+
+tf-check: tf-fmt tf-validate tf-test tf-lint tf-checkov ## All Terraform checks (offline: no AWS credentials)
+
+tf-fmt: ## terraform fmt check
+	$(TF_RUN) -w /w $(TF_IMAGE) fmt -check -recursive -diff
+
+tf-validate: ## terraform validate (dev environment and every module through it)
+	$(TF_RUN) -w /w/envs/dev $(TF_IMAGE) init -backend=false -input=false -lockfile=readonly >/dev/null
+	$(TF_RUN) -w /w/envs/dev $(TF_IMAGE) validate
+
+tf-test: ## terraform test against a mocked AWS provider (least privilege, hardening)
+	@for d in $(TF_TESTED); do \
+		$(TF_RUN) -w /w/$$d $(TF_IMAGE) init -backend=false -input=false -lockfile=readonly >/dev/null && \
+		$(TF_RUN) -w /w/$$d $(TF_IMAGE) test || exit 1; \
+	done
+
+tf-lint: ## tflint with the AWS ruleset
+	$(TF_RUN) -e GITHUB_TOKEN -e TFLINT_PLUGIN_DIR=/w/.tflint.d -w /w $(TFLINT_IMAGE) --init >/dev/null
+	$(TF_RUN) -e TFLINT_PLUGIN_DIR=/w/.tflint.d -w /w $(TFLINT_IMAGE) --recursive --config /w/.tflint.hcl
+
+tf-checkov: ## checkov policy scan (accepted findings are skipped in place, each with its reason)
+	docker run --rm -v "$(TF_DIR):/w:ro" -w /w $(CHECKOV_IMAGE) -d /w --framework terraform --quiet --compact \
+		--skip-path .terraform --skip-path .tflint.d
+
+aws-plan: ## Show what make aws-up would change (verifies the image signature first)
+	TF_IMAGE=$(TF_IMAGE) deploy/terraform/scripts/aws.sh plan
+
+aws-up: ## Deploy to AWS: verify image, apply, copy to ECR, fill secrets, migrate, start
+	TF_IMAGE=$(TF_IMAGE) deploy/terraform/scripts/aws.sh up
+
+aws-down: ## Destroy the AWS environment (asks first)
+	TF_IMAGE=$(TF_IMAGE) deploy/terraform/scripts/aws.sh down
 
 test: ## Unit + integration tests with the race detector
 	go test -race -count=1 ./...

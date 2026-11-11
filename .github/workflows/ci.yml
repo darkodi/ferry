@@ -53,6 +53,20 @@ jobs:
       - name: gitleaks
         run: make gitleaks
 
+  # The AWS environment, checked offline (no credentials, nothing applied):
+  # fmt, validate, terraform test against a mocked provider, tflint and
+  # checkov. The tools run in containers pinned by digest (Makefile).
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: terraform fmt, validate, test, tflint, checkov
+        run: make tf-check
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # tflint fetches its AWS ruleset from GitHub releases
+
   # One image with every binary. On pull requests: build, smoke-test and
   # scan. On main: also push to GHCR with an SBOM and build provenance, and
   # sign it keylessly with cosign (GitHub OIDC; no long-lived key).

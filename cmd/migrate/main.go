@@ -3,10 +3,15 @@
 // task before a deploy (an ECS run-task on AWS), as the schema owner:
 // the application role ferry_app cannot change the schema.
 //
-//	DATABASE_URL  Postgres connection string of the schema owner (required)
+//	DATABASE_URL  Postgres connection string of the schema owner (required);
+//	              missing parts (host, user, password) come from PGHOST,
+//	              PGUSER, PGPASSWORD, as libpq does
+//	FERRY_APP_DB_PASSWORD  password for -app-login (letters and digits, 32+)
 //
-//	migrate            apply every pending migration
-//	migrate -status    list migrations and whether each is applied
+//	migrate                       apply every pending migration
+//	migrate -status               list migrations and whether each is applied
+//	migrate -app-login ferry_svc  also create the services' login role (a
+//	                              member of ferry_app) or reset its password
 package main
 
 import (
@@ -37,6 +42,7 @@ func main() {
 
 func run(log *slog.Logger) error {
 	status := flag.Bool("status", false, "list migrations instead of applying them")
+	appLogin := flag.String("app-login", "", "after migrating, create or update this login role as a member of ferry_app (password from FERRY_APP_DB_PASSWORD)")
 	flag.Parse()
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -76,5 +82,11 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("database version: %w", err)
 	}
 	log.Info("database is up to date", "version", v, "applied_now", len(res))
+	if *appLogin != "" {
+		if err := ensureLogin(ctx, db, *appLogin, os.Getenv("FERRY_APP_DB_PASSWORD")); err != nil {
+			return err
+		}
+		log.Info("app login ready", "role", *appLogin, "member_of", "ferry_app")
+	}
 	return nil
 }

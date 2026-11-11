@@ -21,6 +21,7 @@
 //	FERRY_EVM_XPUB       account xpub for customer deposit addresses; empty assigns none
 //	FERRY_SOLANA_CHAIN   Solana chain name in the database (default solana-local)
 //	FERRY_SOLANA_AUTHORITY  authority public key Solana deposit accounts derive from; empty assigns none
+//	FERRY_SOLANA_AUTHORITY_KMS_KEY_ID  or read that public key from the authority's KMS key (AWS)
 package main
 
 import (
@@ -255,7 +256,7 @@ func railFromEnv(dev bool) (rail.Rail, error) {
 }
 
 // depositAddresses sets up deposit address assignment for every
-// configured chain (FERRY_EVM_XPUB, FERRY_SOLANA_AUTHORITY) and gives
+// configured chain (FERRY_EVM_XPUB, FERRY_SOLANA_AUTHORITY or its KMS key) and gives
 // existing customers an address on any newly configured chain. Both are
 // public keys: the API can compute addresses but never move funds.
 func depositAddresses(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (*chain.Addresses, error) {
@@ -267,11 +268,11 @@ func depositAddresses(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger)
 		}
 		ds = append(ds, d)
 	}
-	if auth := os.Getenv("FERRY_SOLANA_AUTHORITY"); auth != "" {
-		pk, err := sol.PublicKeyFromBase58(auth)
-		if err != nil {
-			return nil, fmt.Errorf("FERRY_SOLANA_AUTHORITY: %w", err)
-		}
+	pk, ok, err := solanaAuthority(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
 		d, err := solana.NewDeriver(envOr("FERRY_SOLANA_CHAIN", "solana-local"), pk)
 		if err != nil {
 			return nil, err
@@ -291,6 +292,36 @@ func depositAddresses(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger)
 		log.Info("assigned deposit addresses to existing customers", "count", n)
 	}
 	return a, nil
+}
+
+// solanaAuthority returns the Solana authority's public key, which the API
+// derives deposit addresses from: given directly (FERRY_SOLANA_AUTHORITY,
+// base58) or read from the KMS key the Solana watcher signs with
+// (FERRY_SOLANA_AUTHORITY_KMS_KEY_ID; the API may only read its public
+// key). Reading it from KMS means the two can never disagree.
+func solanaAuthority(ctx context.Context) (sol.PublicKey, bool, error) {
+	auth, kmsKey := os.Getenv("FERRY_SOLANA_AUTHORITY"), os.Getenv("FERRY_SOLANA_AUTHORITY_KMS_KEY_ID")
+	switch {
+	case auth != "" && kmsKey != "":
+		return sol.PublicKey{}, false, errors.New("set FERRY_SOLANA_AUTHORITY or FERRY_SOLANA_AUTHORITY_KMS_KEY_ID, not both")
+	case kmsKey != "":
+		api, err := awskms.New(ctx, os.Getenv("FERRY_KMS_ENDPOINT"))
+		if err != nil {
+			return sol.PublicKey{}, false, err
+		}
+		ks, err := awskms.NewEd25519Signer(ctx, api, kmsKey)
+		if err != nil {
+			return sol.PublicKey{}, false, err
+		}
+		return sol.PublicKeyFromBytes(ks.Public()), true, nil
+	case auth != "":
+		pk, err := sol.PublicKeyFromBase58(auth)
+		if err != nil {
+			return sol.PublicKey{}, false, fmt.Errorf("FERRY_SOLANA_AUTHORITY: %w", err)
+		}
+		return pk, true, nil
+	}
+	return sol.PublicKey{}, false, nil
 }
 
 func envOr(key, def string) string {
